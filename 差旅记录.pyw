@@ -129,6 +129,11 @@ def db_init():
         )
         # 旧数据一次性迁移: trips 里的餐饮/交通字段迁到新表(幂等)
         migrate_legacy_trips(conn)
+        # 为 trips 表增加 invoice 列(幂等, 已存在则忽略)
+        try:
+            conn.execute("ALTER TABLE trips ADD COLUMN invoice TEXT DEFAULT ''")
+        except Exception:
+            pass
         conn.commit()
     finally:
         conn.close()
@@ -139,11 +144,12 @@ def add_trip(data):
     try:
         cur = conn.execute(
             """INSERT INTO trips (trip_date, weekday, depart, arrive, transport, cost,
-                meal_flag, meal_screenshot, public_flag, public_screenshot)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                meal_flag, meal_screenshot, public_flag, public_screenshot, invoice)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (data['trip_date'], data['weekday'], data['depart'], data['arrive'],
              data['transport'], data['cost'], data['meal_flag'],
-             data['meal_screenshot'], data['public_flag'], data['public_screenshot']),
+             data['meal_screenshot'], data['public_flag'], data['public_screenshot'],
+             data.get('invoice', '')),
         )
         conn.commit()
         return cur.lastrowid
@@ -156,11 +162,13 @@ def update_trip(tid, data):
     try:
         conn.execute(
             """UPDATE trips SET trip_date=?, weekday=?, depart=?, arrive=?, transport=?,
-                cost=?, meal_flag=?, meal_screenshot=?, public_flag=?, public_screenshot=?
+                cost=?, meal_flag=?, meal_screenshot=?, public_flag=?, public_screenshot=?,
+                invoice=?
                WHERE id=?""",
             (data['trip_date'], data['weekday'], data['depart'], data['arrive'],
              data['transport'], data['cost'], data['meal_flag'],
-             data['meal_screenshot'], data['public_flag'], data['public_screenshot'], tid),
+             data['meal_screenshot'], data['public_flag'], data['public_screenshot'],
+             data.get('invoice', ''), tid),
         )
         conn.commit()
     finally:
@@ -421,7 +429,9 @@ def delete_transport(trid):
 def query_transports():
     conn = get_conn()
     try:
-        return conn.execute('SELECT * FROM transports ORDER BY t_date DESC, id DESC').fetchall()
+        return conn.execute(
+            'SELECT * FROM transports WHERE src_trip_id=0 ORDER BY t_date DESC, id DESC'
+        ).fetchall()
     finally:
         conn.close()
 
@@ -509,7 +519,7 @@ def export_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '行程记录'
-    headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式']
+    headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式', '金额(元)', '发票']
     ws.append(headers)
 
     header_fill = PatternFill('solid', fgColor='D9E1F2')
@@ -518,10 +528,12 @@ def export_to_excel(rows):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for i, r in enumerate(rows, 1):
-        ws.append([i, r['trip_date'], r['weekday'], r['depart'], r['arrive'], r['transport']])
+        ws.append([i, r['trip_date'], r['weekday'], r['depart'], r['arrive'],
+                   r['transport'], r['cost'], '有' if r['invoice'] else ''])
 
+    total_cost = round(sum(r['cost'] for r in rows), 2)
     total_row = ws.max_row + 1
-    ws.append(['', '', '', '', '总条数', len(rows)])
+    ws.append(['', '', '', '', '', '总条数', total_cost, len(rows)])
 
     # 表头样式
     for cell in ws[1]:
@@ -534,13 +546,16 @@ def export_to_excel(rows):
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         for cell in row:
             cell.border = border
+            if cell.column == 7:  # 金额列
+                cell.number_format = '0.00'
+                cell.alignment = Alignment(horizontal='right')
 
     # 合计行样式
     for cell in ws[total_row]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 9, 16, 16, 14]
+    widths = [6, 12, 9, 16, 16, 14, 12, 8]
     for idx, w in enumerate(widths, 1):
         ws.column_dimensions[chr(64 + idx)].width = w
     ws.freeze_panes = 'A2'
@@ -662,7 +677,7 @@ def export_transports_to_excel(rows):
 # ---------------- 新增/编辑对话框 ----------------
 
 class EditDialog(tk.Toplevel):
-    """新增或编辑一条行程记录"""
+    """新增或编辑一条行程记录（含金额 + 发票上传）"""
 
     def __init__(self, master, record=None):
         super().__init__(master)
@@ -679,9 +694,18 @@ class EditDialog(tk.Toplevel):
         self.depart_var = tk.StringVar(value=self.record.get('depart') or '')
         self.arrive_var = tk.StringVar(value=self.record.get('arrive') or '')
         self.transport_var = tk.StringVar(value=self.record.get('transport') or '')
+        cost = self.record.get('cost')
+        self.cost_var = tk.StringVar(value=('%g' % cost) if cost else '')
+
+        # 发票: 编辑时已入库的相对路径 / 新选择的源路径
+        self.old_invoice = self.record.get('invoice') or ''
+        self.new_invoice_src = ''
+        self.invoice_thumb = None
 
         self._build()
         self._update_weekday()
+        if self.old_invoice:
+            self._preview_invoice(rel_to_abs(self.old_invoice))
 
         # 居中显示
         self.update_idletasks()
@@ -724,6 +748,21 @@ class EditDialog(tk.Toplevel):
         ttk.Combobox(row, textvariable=self.transport_var, values=TRANSPORT_OPTIONS,
                      state='readonly', width=28).pack(side='left', padx=(6, 0))
 
+        # 金额
+        row = ttk.Frame(body)
+        row.pack(fill='x', **pad)
+        ttk.Label(row, text='金额(元)').pack(side='left')
+        ttk.Entry(row, textvariable=self.cost_var, width=12).pack(side='left', padx=(6, 0))
+
+        # 发票上传
+        inv_box = ttk.LabelFrame(body, text='发票上传', padding=8)
+        inv_box.pack(fill='x', **pad)
+        self.inv_btn = ttk.Button(inv_box, text='选择发票', width=10, command=self._pick_invoice)
+        self.inv_btn.pack(side='left')
+        self.inv_label = ttk.Label(inv_box, text='已上传' if self.old_invoice else '未选择发票',
+                                   foreground='#666666')
+        self.inv_label.pack(side='left', padx=(10, 0))
+
         # 按钮行
         row = ttk.Frame(body)
         row.pack(fill='x', pady=(10, 0))
@@ -739,6 +778,25 @@ class EditDialog(tk.Toplevel):
         d = parse_date(self.date_var.get())
         self.weekday_var.set(weekday_of(self.date_var.get()) if d else '日期格式: YYYY-MM-DD')
 
+    def _pick_invoice(self):
+        path = filedialog.askopenfilename(
+            title='选择发票图片', parent=self,
+            filetypes=[('图片文件', '*.png *.jpg *.jpeg *.bmp *.gif *.webp'), ('所有文件', '*.*')])
+        if not path:
+            return
+        self.new_invoice_src = path
+        self._preview_invoice(path)
+
+    def _preview_invoice(self, path):
+        try:
+            img = Image.open(path)
+            img.thumbnail((150, 100))
+            photo = ImageTk.PhotoImage(img)
+            self.inv_label.configure(image=photo, text='')
+            self.invoice_thumb = photo
+        except Exception:
+            self.inv_label.configure(image='', text='已选择发票(无法预览)')
+
     def _save(self):
         date_str = self.date_var.get().strip()
         d = parse_date(date_str)
@@ -751,6 +809,24 @@ class EditDialog(tk.Toplevel):
         if not depart or not arrive or not transport:
             messagebox.showwarning('提示', '请填写出发地、到达地、交通方式', parent=self)
             return
+        # 金额
+        cost = 0.0
+        cost_text = self.cost_var.get().strip()
+        if cost_text:
+            try:
+                cost = round(float(cost_text), 2)
+            except ValueError:
+                messagebox.showwarning('提示', '金额请输入数字', parent=self)
+                return
+        # 发票处理
+        if self.new_invoice_src:
+            invoice = save_screenshot(self.new_invoice_src, d.isoformat(), 'invoice')
+            if self.old_invoice:
+                remove_screenshot_file(self.old_invoice)
+        elif self.old_invoice:
+            invoice = self.old_invoice
+        else:
+            invoice = ''
 
         date_iso = d.isoformat()
         data = {
@@ -759,11 +835,12 @@ class EditDialog(tk.Toplevel):
             'depart': depart,
             'arrive': arrive,
             'transport': transport,
-            'cost': 0.0,
+            'cost': cost,
             'meal_flag': 0,
             'meal_screenshot': '',
             'public_flag': 0,
             'public_screenshot': '',
+            'invoice': invoice,
         }
         if self.record:
             update_trip(self.record['id'], data)
@@ -1167,8 +1244,9 @@ class MainApp(tk.Tk):
 
     # 表头顺序与固定列宽(与数据行对齐)
     HEAD_COLS = [
-        ('date', '日期', 110), ('weekday', '星期', 80), ('depart', '出发地', 180),
-        ('arrive', '到达地', 180), ('transport', '交通方式', 140),
+        ('date', '日期', 100), ('weekday', '星期', 70), ('depart', '出发地', 150),
+        ('arrive', '到达地', 150), ('transport', '交通方式', 120),
+        ('cost', '金额(元)', 100), ('invoice', '发票', 80),
     ]
     DAY_BG = '#EAF1F8'
     DAY_BG_OPEN = '#D7E7F5'
@@ -1727,22 +1805,32 @@ class MainApp(tk.Tk):
 
         # —— 总条数合并行(跨整行) ——
         if day_map:
+            total_cost = sum(r['cost'] for r in rows)
+            ttl_text = '合计   %d 条行程' % len(rows)
+            if total_cost:
+                ttl_text += '     总金额 ¥%.2f' % total_cost
             ttl = tk.Label(inner,
-                           text='合计   %d 条行程' % len(rows),
+                           text=ttl_text,
                            anchor='center', font=FONT_BOLD, bg=self.TOTAL_BG, height=1)
             ttl.grid(row=row, column=0, columnspan=len(self.HEAD_COLS),
                      sticky='nsew', pady=(2, 0))
             row += 1
 
         flt = '全部记录' if not date_from and not date_to else ('%s ~ %s' % (date_from or '最早', date_to or '至今'))
+        total_cost = sum(r['cost'] for r in rows)
         self._trip_summary = '共 %d 条行程   筛选范围: %s' % (len(rows), flt)
+        if total_cost:
+            self._trip_summary += '   总金额 ¥%.2f' % total_cost
         self._refresh_status()
         self.canvas.configure(scrollregion=self.canvas.bbox('all'))
         self.canvas.yview_moveto(0)
 
     def _insert_trip_row(self, parent, row, rec):
+        cost_val = rec['cost']
         values = (rec['trip_date'], rec['weekday'], rec['depart'], rec['arrive'],
-                  rec['transport'])
+                  rec['transport'],
+                  '¥%.2f' % cost_val if cost_val else '—',
+                  '有' if rec['invoice'] else '—')
         bg = self.SEL_BG if self.cur_trip_id == rec['id'] else '#FFFFFF'
         cells = []
         for i, v in enumerate(values):
