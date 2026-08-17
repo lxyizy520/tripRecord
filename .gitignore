@@ -1,0 +1,8 @@
+# IDE / tools
+.qoder/
+.codegraph/
+.reasonix/
+reasonix.toml
+
+# 打包产物
+差旅记录.exe
