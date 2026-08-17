@@ -1,0 +1,21 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: Q0DeR-MaG1C-BrAnCh-Fo2-NoN-GiT-Or-No-C0MmIt
+nodes_managed: true
+exported_at: "2026-08-17T06:37:10Z"
+modules:
+    "":
+        dir_name: 差旅费用详情记录桌面应用
+        title: 差旅费用详情记录桌面应用
+        scope:
+            - 差旅记录.pyw
+            - reasonix.toml
+            - .reasonix/
+            - 启动差旅记录.bat
+            - 差旅记录.exe
+            - 差旅费用详情记录表.xlsx
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

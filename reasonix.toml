@@ -1,0 +1,2 @@
+[permissions]
+allow = ["Bash=Get-ChildItem -Force | Select-Object Mode, Length, LastWriteTime, Name | Format-Table -AutoSize"]
