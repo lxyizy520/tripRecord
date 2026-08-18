@@ -1929,9 +1929,9 @@ class MainApp(tk.Tk):
 
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
         ttk.Label(bar, text='标签').pack(side='left')
-        tag_cbo = ttk.Combobox(bar, textvariable=self.trip_tag_var, values=get_all_tags(), width=24)
-        tag_cbo.pack(side='left', padx=(3, 0))
-        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh())
+        self.trip_tag_cbo = ttk.Combobox(bar, textvariable=self.trip_tag_var, values=get_all_tags(), width=36)
+        self.trip_tag_cbo.pack(side='left', padx=(3, 0))
+        self.trip_tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh())
 
     # 表头顺序与固定列宽(与数据行对齐)
     HEAD_COLS = [
@@ -2023,9 +2023,9 @@ class MainApp(tk.Tk):
 
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
         ttk.Label(bar, text='标签').pack(side='left')
-        tag_cbo = ttk.Combobox(bar, textvariable=self.lod_tag_var, values=get_all_tags(), width=24)
-        tag_cbo.pack(side='left', padx=(3, 0))
-        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_lodging())
+        self.lod_tag_cbo = ttk.Combobox(bar, textvariable=self.lod_tag_var, values=get_all_tags(), width=36)
+        self.lod_tag_cbo.pack(side='left', padx=(3, 0))
+        self.lod_tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_lodging())
 
         body = ttk.Frame(wrap, padding=(0, 6, 0, 0))
         body.pack(fill='both', expand=True)
@@ -2067,6 +2067,7 @@ class MainApp(tk.Tk):
         self.lod_canvas.yview_scroll(int(-event.delta / 120), 'units')
 
     def refresh_lodging(self):
+        self._reload_tag_combos()
         for name in ('lod_from_var', 'lod_to_var'):
             v = getattr(self, name).get().strip()
             if v and parse_date(v) is None:
@@ -2112,6 +2113,13 @@ class MainApp(tk.Tk):
         self.lod_canvas.configure(scrollregion=self.lod_canvas.bbox('all'))
         self.lod_canvas.yview_moveto(0)
 
+    def _reload_tag_combos(self):
+        """重新加载所有标签下拉菜单的候选值"""
+        tags = get_all_tags()
+        for cbo in (self.trip_tag_cbo, self.lod_tag_cbo,
+                    self.meal_tag_cbo, self.tr_tag_cbo, self.calc_tag_combo):
+            cbo['values'] = tags
+
     def _refresh_status(self):
         parts = []
         for attr in ('_trip_summary', '_lod_summary', '_meal_summary', '_transport_summary'):
@@ -2155,9 +2163,9 @@ class MainApp(tk.Tk):
 
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
         ttk.Label(bar, text='标签').pack(side='left')
-        tag_cbo = ttk.Combobox(bar, textvariable=self.meal_tag_var, values=get_all_tags(), width=24)
-        tag_cbo.pack(side='left', padx=(3, 0))
-        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_meals())
+        self.meal_tag_cbo = ttk.Combobox(bar, textvariable=self.meal_tag_var, values=get_all_tags(), width=36)
+        self.meal_tag_cbo.pack(side='left', padx=(3, 0))
+        self.meal_tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_meals())
 
         body = ttk.Frame(tab, padding=(0, 4, 0, 0))
         body.pack(fill='both', expand=True)
@@ -2191,6 +2199,7 @@ class MainApp(tk.Tk):
         self.meal_canvas.yview_scroll(int(-event.delta / 120), 'units')
 
     def refresh_meals(self):
+        self._reload_tag_combos()
         date_from = self.meal_date_from_var.get().strip()
         date_to = self.meal_date_to_var.get().strip()
         for var in (self.meal_date_from_var, self.meal_date_to_var):
@@ -2240,12 +2249,16 @@ class MainApp(tk.Tk):
         self.refresh_meals()
 
     def _add_meal(self):
-        MealDialog(self)
+        dlg = MealDialog(self)
+        self.wait_window(dlg)
+        self.refresh_meals()
 
     def _edit_meal(self, mid):
         rec = get_meal(mid)
         if rec:
-            MealDialog(self, dict(rec))
+            dlg = MealDialog(self, dict(rec))
+            self.wait_window(dlg)
+            self.refresh_meals()
 
     def _export_meals(self):
         rows = query_meals(self.meal_date_from_var.get().strip() or '',
@@ -2295,9 +2308,9 @@ class MainApp(tk.Tk):
 
         ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
         ttk.Label(bar, text='标签').pack(side='left')
-        tag_cbo = ttk.Combobox(bar, textvariable=self.tr_tag_var, values=get_all_tags(), width=24)
-        tag_cbo.pack(side='left', padx=(3, 0))
-        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_transports())
+        self.tr_tag_cbo = ttk.Combobox(bar, textvariable=self.tr_tag_var, values=get_all_tags(), width=36)
+        self.tr_tag_cbo.pack(side='left', padx=(3, 0))
+        self.tr_tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_transports())
 
         body = ttk.Frame(tab, padding=(0, 4, 0, 0))
         body.pack(fill='both', expand=True)
@@ -2331,6 +2344,7 @@ class MainApp(tk.Tk):
         self.tr_canvas.yview_scroll(int(-event.delta / 120), 'units')
 
     def refresh_transports(self):
+        self._reload_tag_combos()
         date_from = self.tr_date_from_var.get().strip()
         date_to = self.tr_date_to_var.get().strip()
         for var in (self.tr_date_from_var, self.tr_date_to_var):
@@ -2383,12 +2397,16 @@ class MainApp(tk.Tk):
         self.refresh_transports()
 
     def _add_transport(self):
-        TransportDialog(self)
+        dlg = TransportDialog(self)
+        self.wait_window(dlg)
+        self.refresh_transports()
 
     def _edit_transport(self, tid):
         rec = get_transport(tid)
         if rec:
-            TransportDialog(self, dict(rec))
+            dlg = TransportDialog(self, dict(rec))
+            self.wait_window(dlg)
+            self.refresh_transports()
 
     def _export_transports(self):
         rows = query_transports(self.tr_date_from_var.get().strip() or '',
@@ -2479,12 +2497,16 @@ class MainApp(tk.Tk):
         self.refresh_lodging()
 
     def _add_lodging(self):
-        LodgingDialog(self)
+        dlg = LodgingDialog(self)
+        self.wait_window(dlg)
+        self.refresh_lodging()
 
     def _edit_lodging(self, lid):
         rec = get_lodging(lid)
         if rec:
-            LodgingDialog(self, dict(rec))
+            dlg = LodgingDialog(self, dict(rec))
+            self.wait_window(dlg)
+            self.refresh_lodging()
 
     def _export_lodging(self):
         rows = query_lodging(self.lod_from_var.get().strip(),
@@ -2596,6 +2618,7 @@ class MainApp(tk.Tk):
 
     # ---------- 数据刷新 ----------
     def refresh(self):
+        self._reload_tag_combos()
         date_from = self.date_from_var.get().strip()
         date_to = self.date_to_var.get().strip()
         for name in ('date_from_var', 'date_to_var'):
@@ -2779,7 +2802,9 @@ class MainApp(tk.Tk):
     def _edit_by_id(self, trip_id):
         rec = get_trip(trip_id)
         if rec:
-            EditDialog(self, dict(rec))
+            dlg = EditDialog(self, dict(rec))
+            self.wait_window(dlg)
+            self.refresh()
 
     def _on_right_click_row(self, event, trip_id):
         self._select_trip(trip_id)
@@ -2790,7 +2815,9 @@ class MainApp(tk.Tk):
 
     # ---------- 工具栏行为 ----------
     def _add(self):
-        EditDialog(self)
+        dlg = EditDialog(self)
+        self.wait_window(dlg)
+        self.refresh()
 
     def _set_today(self):
         today = datetime.date.today().isoformat()
