@@ -847,58 +847,99 @@ def calc_trip_total(tag):
 
 # ---------------- 导出 Excel ----------------
 
+
+def _batch_trip_files(trip_ids, file_type):
+    """批量获取行程指定类型的全部文件路径, 返回 {trip_id: [rel_path, ...]}"""
+    if not trip_ids:
+        return {}
+    placeholders = ','.join('?' * len(trip_ids))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            'SELECT trip_id, file_path FROM trip_files WHERE trip_id IN (%s) AND file_type=? ORDER BY id' % placeholders,
+            list(trip_ids) + [file_type]
+        ).fetchall()
+        result = {}
+        for r in rows:
+            result.setdefault(r[0], []).append(r[1])
+        return result
+    finally:
+        conn.close()
+
+
+def _batch_lod_files(lod_ids, file_type):
+    """批量获取住宿指定类型的全部文件路径, 返回 {lod_id: [rel_path, ...]}"""
+    if not lod_ids:
+        return {}
+    placeholders = ','.join('?' * len(lod_ids))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            'SELECT lodging_id, file_path FROM lodging_files WHERE lodging_id IN (%s) AND file_type=? ORDER BY id' % placeholders,
+            list(lod_ids) + [file_type]
+        ).fetchall()
+        result = {}
+        for r in rows:
+            result.setdefault(r[0], []).append(r[1])
+        return result
+    finally:
+        conn.close()
+
+
+
 def export_to_excel(rows):
     """导出全部/筛选记录为 xlsx,返回 (文件路径, 条数)"""
     if not rows:
         return None, 0
-    # 批量获取附件计数
     trip_ids = [r['id'] for r in rows]
-    file_counts = get_trip_file_counts(trip_ids)
+    inv_files = _batch_trip_files(trip_ids, 'invoice')
+    it_files = _batch_trip_files(trip_ids, 'itinerary')
+
     wb = Workbook()
     ws = wb.active
     ws.title = '行程记录'
-    headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式', '金额(元)', '发票', '行程单', '出差标签']
+    headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式', '金额(元)',
+               '发票', '发票地址', '行程单', '行程单地址', '出差标签']
     ws.append(headers)
+
+    for i, r in enumerate(rows, 1):
+        rid = r['id']
+        inv_list = inv_files.get(rid, [])
+        it_list = it_files.get(rid, [])
+        inv_text = '发票(%d)' % len(inv_list) if inv_list else ''
+        inv_path = rel_to_abs(inv_list[0]) if inv_list else ''
+        it_text = '行程单(%d)' % len(it_list) if it_list else ''
+        it_path = rel_to_abs(it_list[0]) if it_list else ''
+        ws.append([i, r['trip_date'], r['weekday'], r['depart'], r['arrive'],
+                   r['transport'], r['cost'], inv_text, inv_path, it_text, it_path, r['trip_tag'] or ''])
+
+    total_cost = round(sum(r['cost'] for r in rows), 2)
+    total_row = ws.max_row + 1
+    ws.append(['', '', '', '', '', '总条数', total_cost, len(rows), '', '', '', ''])
 
     header_fill = PatternFill('solid', fgColor='D9E1F2')
     header_font = Font(bold=True)
     thin = Side(style='thin', color='BFBFBF')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    for i, r in enumerate(rows, 1):
-        fc = file_counts.get(r['id'], {'invoice': 0, 'itinerary': 0})
-        inv_text = '有(%d)' % fc['invoice'] if fc['invoice'] else ''
-        it_text = '有(%d)' % fc['itinerary'] if fc['itinerary'] else ''
-        ws.append([i, r['trip_date'], r['weekday'], r['depart'], r['arrive'],
-                   r['transport'], r['cost'], inv_text, it_text, r['trip_tag'] or ''])
-
-    total_cost = round(sum(r['cost'] for r in rows), 2)
-    total_row = ws.max_row + 1
-    ws.append(['', '', '', '', '', '总条数', total_cost, len(rows), '', ''])
-
-    # 表头样式
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal='center', vertical='center')
         cell.border = border
-
-    # 数据样式
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         for cell in row:
             cell.border = border
-            if cell.column == 7:  # 金额列
+            if cell.column == 7:
                 cell.number_format = '0.00'
                 cell.alignment = Alignment(horizontal='right')
-
-    # 合计行样式
     for cell in ws[total_row]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 9, 16, 16, 14, 12, 10, 10]
+    widths = [6, 12, 9, 16, 16, 14, 12, 10, 40, 10, 40, 20]
     for idx, w in enumerate(widths, 1):
-        ws.column_dimensions[chr(64 + idx)].width = w
+        col = chr(64 + idx) if idx <= 26 else chr(64 + (idx - 1) // 26) + chr(65 + (idx - 1) % 26)
+        ws.column_dimensions[col].width = w
     ws.freeze_panes = 'A2'
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -911,51 +952,55 @@ def export_lodging_to_excel(rows):
     """导出全部住宿记录为 xlsx,返回 (文件路径, 条数)"""
     if not rows:
         return None, 0
-    # 批量获取附件计数
     lod_ids = [r['id'] for r in rows]
-    file_counts = get_lodging_file_counts(lod_ids)
+    inv_files = _batch_lod_files(lod_ids, 'invoice')
+    rec_files = _batch_lod_files(lod_ids, 'receipt')
+
     wb = Workbook()
     ws = wb.active
     ws.title = '住宿记录'
-    headers = ['序号', '入住日期', '退房日期', '酒店名称', '金额(元)', '发票', '水单', '出差标签']
+    headers = ['序号', '入住日期', '退房日期', '酒店名称', '金额(元)',
+               '发票', '发票地址', '水单', '水单地址', '出差标签']
     ws.append(headers)
+
+    for i, r in enumerate(rows, 1):
+        rid = r['id']
+        inv_list = inv_files.get(rid, [])
+        rec_list = rec_files.get(rid, [])
+        inv_text = '发票(%d)' % len(inv_list) if inv_list else ''
+        inv_path = rel_to_abs(inv_list[0]) if inv_list else ''
+        rec_text = '水单(%d)' % len(rec_list) if rec_list else ''
+        rec_path = rel_to_abs(rec_list[0]) if rec_list else ''
+        ws.append([i, r['checkin_date'], r['checkout_date'], r['hotel'], r['amount'],
+                   inv_text, inv_path, rec_text, rec_path, r['trip_tag'] or ''])
+
+    total = sum(r['amount'] for r in rows)
+    total_row = ws.max_row + 1
+    ws.append(['', '', '', '合计', round(total, 2), '', '', '', '', ''])
 
     header_fill = PatternFill('solid', fgColor='D9E1F2')
     header_font = Font(bold=True)
     thin = Side(style='thin', color='BFBFBF')
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    for i, r in enumerate(rows, 1):
-        fc = file_counts.get(r['id'], {'invoice': 0, 'receipt': 0})
-        inv_text = '有(%d)' % fc['invoice'] if fc['invoice'] else ''
-        rec_text = '有(%d)' % fc['receipt'] if fc['receipt'] else ''
-        ws.append([i, r['checkin_date'], r['checkout_date'], r['hotel'], r['amount'],
-                   inv_text, rec_text, r['trip_tag'] or ''])
-
-    total = sum(r['amount'] for r in rows)
-    total_row = ws.max_row + 1
-    ws.append(['', '', '', '合计', round(total, 2), '', ''])
-
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal='center', vertical='center')
         cell.border = border
-
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         for cell in row:
             cell.border = border
             if cell.column == 5:
                 cell.number_format = '0.00'
                 cell.alignment = Alignment(horizontal='right')
-
     for cell in ws[total_row]:
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 12, 30, 12, 10, 10]
+    widths = [6, 12, 12, 30, 12, 10, 40, 10, 40, 20]
     for idx, w in enumerate(widths, 1):
-        ws.column_dimensions[chr(64 + idx)].width = w
+        col = chr(64 + idx) if idx <= 26 else chr(64 + (idx - 1) // 26) + chr(65 + (idx - 1) % 26)
+        ws.column_dimensions[col].width = w
     ws.freeze_panes = 'A2'
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -991,13 +1036,38 @@ def export_meals_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '餐饮记录'
-    headers = ['序号', '日期', '餐次', '用餐截图', '出差标签']
+    headers = ['序号', '日期', '餐次', '用餐截图', '截图地址', '出差标签']
+    ws.append(headers)
+
     for i, r in enumerate(rows, 1):
-        ws.append([i, r['meal_date'], r['meal_type'], r['screenshot'], r['trip_tag'] or ''])
-    _style_workbook(ws, rows, headers, ['', '', '共 %d 条' % len(rows), '', ''])
+        screenshot = r['screenshot'] or ''
+        has_screenshot = '是' if screenshot else ''
+        screenshot_path = rel_to_abs(screenshot) if screenshot else ''
+        ws.append([i, r['meal_date'], r['meal_type'], has_screenshot, screenshot_path, r['trip_tag'] or ''])
+
+    total_row = ws.max_row + 1
+    ws.append(['', '', '共 %d 条' % len(rows), '', '', ''])
+
+    header_fill = PatternFill('solid', fgColor='D9E1F2')
+    header_font = Font(bold=True)
+    thin = Side(style='thin', color='BFBFBF')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = border
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.border = border
+    for cell in ws[total_row]:
+        cell.font = Font(bold=True)
+
     ws.freeze_panes = 'A2'
-    for idx, w in enumerate([6, 12, 10, 40, 30], 1):
+    for idx, w in enumerate([6, 12, 10, 12, 40, 20], 1):
         ws.column_dimensions[chr(64 + idx)].width = w
+
+    os.makedirs(EXPORT_DIR, exist_ok=True)
     path = os.path.join(EXPORT_DIR, '餐饮记录_%s.xlsx' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     wb.save(path)
     return path, len(rows)
@@ -1009,14 +1079,44 @@ def export_transports_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '交通记录'
-    headers = ['序号', '日期', '出发地', '到达地', '金额(元)', '交通截图', '出差标签']
+    headers = ['序号', '日期', '出发地', '到达地', '金额(元)', '交通截图', '截图地址', '出差标签']
+    ws.append(headers)
+
     for i, r in enumerate(rows, 1):
-        ws.append([i, r['t_date'], r['depart'], r['arrive'], r['amount'], r['screenshot'], r['trip_tag'] or ''])
+        screenshot = r['screenshot'] or ''
+        has_screenshot = '是' if screenshot else ''
+        screenshot_path = rel_to_abs(screenshot) if screenshot else ''
+        ws.append([i, r['t_date'], r['depart'], r['arrive'], r['amount'],
+                   has_screenshot, screenshot_path, r['trip_tag'] or ''])
+
     total = round(sum(r['amount'] for r in rows), 2)
-    _style_workbook(ws, rows, headers, ['', '', '', '合计', total, '', ''])
+    total_row = ws.max_row + 1
+    ws.append(['', '', '', '合计', total, '', '', ''])
+
+    header_fill = PatternFill('solid', fgColor='D9E1F2')
+    header_font = Font(bold=True)
+    thin = Side(style='thin', color='BFBFBF')
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for cell in ws[1]:
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal='center', vertical='center')
+        cell.border = border
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        for cell in row:
+            cell.border = border
+            if cell.column == 5:
+                cell.number_format = '0.00'
+                cell.alignment = Alignment(horizontal='right')
+    for cell in ws[total_row]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill('solid', fgColor='FCE4D6')
+
     ws.freeze_panes = 'A2'
-    for idx, w in enumerate([6, 12, 16, 16, 12, 40, 30], 1):
+    for idx, w in enumerate([6, 12, 16, 16, 12, 12, 40, 20], 1):
         ws.column_dimensions[chr(64 + idx)].width = w
+
+    os.makedirs(EXPORT_DIR, exist_ok=True)
     path = os.path.join(EXPORT_DIR, '交通记录_%s.xlsx' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     wb.save(path)
     return path, len(rows)
