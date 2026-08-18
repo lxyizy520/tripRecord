@@ -899,7 +899,7 @@ def export_to_excel(rows):
     ws = wb.active
     ws.title = '行程记录'
     headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式', '金额(元)',
-               '发票', '发票地址', '行程单', '行程单地址', '出差标签']
+               '发票', '行程单', '出差标签', '发票地址', '行程单地址']
     ws.append(headers)
 
     for i, r in enumerate(rows, 1):
@@ -911,7 +911,7 @@ def export_to_excel(rows):
         it_text = '行程单(%d)' % len(it_list) if it_list else ''
         it_path = rel_to_abs(it_list[0]) if it_list else ''
         ws.append([i, r['trip_date'], r['weekday'], r['depart'], r['arrive'],
-                   r['transport'], r['cost'], inv_text, inv_path, it_text, it_path, r['trip_tag'] or ''])
+                   r['transport'], r['cost'], inv_text, it_text, r['trip_tag'] or '', inv_path, it_path])
 
     total_cost = round(sum(r['cost'] for r in rows), 2)
     total_row = ws.max_row + 1
@@ -936,7 +936,7 @@ def export_to_excel(rows):
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 9, 16, 16, 14, 12, 10, 40, 10, 40, 20]
+    widths = [6, 12, 9, 16, 16, 14, 12, 10, 10, 20, 40, 40]
     for idx, w in enumerate(widths, 1):
         col = chr(64 + idx) if idx <= 26 else chr(64 + (idx - 1) // 26) + chr(65 + (idx - 1) % 26)
         ws.column_dimensions[col].width = w
@@ -960,7 +960,7 @@ def export_lodging_to_excel(rows):
     ws = wb.active
     ws.title = '住宿记录'
     headers = ['序号', '入住日期', '退房日期', '酒店名称', '金额(元)',
-               '发票', '发票地址', '水单', '水单地址', '出差标签']
+               '发票', '水单', '出差标签', '发票地址', '水单地址']
     ws.append(headers)
 
     for i, r in enumerate(rows, 1):
@@ -972,7 +972,7 @@ def export_lodging_to_excel(rows):
         rec_text = '水单(%d)' % len(rec_list) if rec_list else ''
         rec_path = rel_to_abs(rec_list[0]) if rec_list else ''
         ws.append([i, r['checkin_date'], r['checkout_date'], r['hotel'], r['amount'],
-                   inv_text, inv_path, rec_text, rec_path, r['trip_tag'] or ''])
+                   inv_text, rec_text, r['trip_tag'] or '', inv_path, rec_path])
 
     total = sum(r['amount'] for r in rows)
     total_row = ws.max_row + 1
@@ -997,7 +997,7 @@ def export_lodging_to_excel(rows):
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 12, 30, 12, 10, 40, 10, 40, 20]
+    widths = [6, 12, 12, 30, 12, 10, 10, 20, 40, 40]
     for idx, w in enumerate(widths, 1):
         col = chr(64 + idx) if idx <= 26 else chr(64 + (idx - 1) // 26) + chr(65 + (idx - 1) % 26)
         ws.column_dimensions[col].width = w
@@ -1036,14 +1036,14 @@ def export_meals_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '餐饮记录'
-    headers = ['序号', '日期', '餐次', '用餐截图', '截图地址', '出差标签']
+    headers = ['序号', '日期', '餐次', '用餐截图', '出差标签', '截图地址']
     ws.append(headers)
 
     for i, r in enumerate(rows, 1):
         screenshot = r['screenshot'] or ''
         has_screenshot = '是' if screenshot else ''
         screenshot_path = rel_to_abs(screenshot) if screenshot else ''
-        ws.append([i, r['meal_date'], r['meal_type'], has_screenshot, screenshot_path, r['trip_tag'] or ''])
+        ws.append([i, r['meal_date'], r['meal_type'], has_screenshot, r['trip_tag'] or '', screenshot_path])
 
     total_row = ws.max_row + 1
     ws.append(['', '', '共 %d 条' % len(rows), '', '', ''])
@@ -1064,7 +1064,7 @@ def export_meals_to_excel(rows):
         cell.font = Font(bold=True)
 
     ws.freeze_panes = 'A2'
-    for idx, w in enumerate([6, 12, 10, 12, 40, 20], 1):
+    for idx, w in enumerate([6, 12, 10, 12, 20, 40], 1):
         ws.column_dimensions[chr(64 + idx)].width = w
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
@@ -1079,7 +1079,7 @@ def export_transports_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '交通记录'
-    headers = ['序号', '日期', '出发地', '到达地', '金额(元)', '交通截图', '截图地址', '出差标签']
+    headers = ['序号', '日期', '出发地', '到达地', '金额(元)', '交通截图', '出差标签', '截图地址']
     ws.append(headers)
 
     for i, r in enumerate(rows, 1):
@@ -1087,7 +1087,7 @@ def export_transports_to_excel(rows):
         has_screenshot = '是' if screenshot else ''
         screenshot_path = rel_to_abs(screenshot) if screenshot else ''
         ws.append([i, r['t_date'], r['depart'], r['arrive'], r['amount'],
-                   has_screenshot, screenshot_path, r['trip_tag'] or ''])
+                   has_screenshot, r['trip_tag'] or '', screenshot_path])
 
     total = round(sum(r['amount'] for r in rows), 2)
     total_row = ws.max_row + 1
@@ -1113,7 +1113,7 @@ def export_transports_to_excel(rows):
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
     ws.freeze_panes = 'A2'
-    for idx, w in enumerate([6, 12, 16, 16, 12, 12, 40, 20], 1):
+    for idx, w in enumerate([6, 12, 16, 16, 12, 12, 20, 40], 1):
         ws.column_dimensions[chr(64 + idx)].width = w
 
     os.makedirs(EXPORT_DIR, exist_ok=True)
