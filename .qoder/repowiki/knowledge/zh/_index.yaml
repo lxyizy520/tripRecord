@@ -3,17 +3,16 @@ schema_version: 1
 locale: zh-CN
 branch: main
 nodes_managed: true
-exported_at: "2026-08-17T07:14:41Z"
+exported_at: "2026-08-18T03:29:46Z"
 modules:
     "":
         dir_name: 差旅费用详情记录桌面应用
         title: 差旅费用详情记录桌面应用
         scope:
-            - .reasonix/
-            - reasonix.toml
-            - 启动差旅记录.bat
             - 差旅记录.pyw
-            - 差旅记录.exe
+            - 启动差旅记录.bat
+            - .gitignore
+            - 天津华瑞百川科技发展有限公司--《差旅管理制度》（内部资料拒绝转发）.pdf
             - 差旅费用详情记录表.xlsx
         source_files: []
         children: []

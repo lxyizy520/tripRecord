@@ -7,12 +7,14 @@
 
 import datetime
 import os
+import re
 import shutil
 import sqlite3
 import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import fitz  # PyMuPDF
 from PIL import Image, ImageTk
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -28,11 +30,69 @@ SCREENSHOTS_DIR = os.path.join(DATA_DIR, 'screenshots')
 EXPORT_DIR = os.path.join(BASE_DIR, '导出文件')
 DB_PATH = os.path.join(DATA_DIR, '差旅记录.db')
 
-TRANSPORT_OPTIONS = ['公共交通', '打车', '公共交通+打车', '甲方提供', '我方租车']
+TRANSPORT_OPTIONS = ['公共交通', '打车', '高铁', '飞机', '公共交通+打车', '甲方提供', '我方租车']
 WEEKDAY_NAMES = ['星期一', '星期二', '星期三', '星期四', '星期五', '星期六', '星期日']
 IMG_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+INVOICE_EXTS = IMG_EXTS + ('.pdf',)
 FONT = ('Microsoft YaHei UI', 10)
 FONT_BOLD = ('Microsoft YaHei UI', 10, 'bold')
+
+# ---------------- 城市分类与费用标准 ----------------
+# 一类城市
+CITY_TIER1 = ['北京', '上海', '广州', '深圳']
+# 二类城市: 省会 + 直辖市 + 计划单列市 + 经济发达城市
+CITY_TIER2 = [
+    # 省会 / 直辖市
+    '天津', '重庆',
+    '石家庄', '太原', '呼和浩特', '沈阳', '长春', '哈尔滨',
+    '南京', '杭州', '合肥', '福州', '南昌', '济南', '郑州',
+    '武汉', '长沙', '南宁', '海口', '成都', '贵阳', '昆明',
+    '拉萨', '西安', '兰州', '西宁', '银川', '乌鲁木齐',
+    # 计划单列市
+    '大连', '青岛', '宁波', '厦门',
+    # 经济发达城市
+    '苏州', '无锡', '常州', '东莞', '佛山', '珠海', '温州',
+    '烟台', '泉州', '潍坊',
+]
+# 三类城市: 其他地级市、县级市、县城
+
+# 费用标准 (餐费, 市内交通)
+EXPENSE_TIER1 = (80, 40)
+EXPENSE_TIER2 = (60, 30)
+EXPENSE_TIER3 = (50, 20)
+
+
+def classify_city(city_name):
+    """根据城市名判断类别, 返回 (tier_num, meal_rate, transit_rate)"""
+    if not city_name:
+        return (3, *EXPENSE_TIER3)
+    city = city_name.strip().rstrip('市省区县')
+    # 一类
+    for c in CITY_TIER1:
+        if city == c or c in city_name:
+            return (1, *EXPENSE_TIER1)
+    # 二类
+    for c in CITY_TIER2:
+        if city == c or c in city_name:
+            return (2, *EXPENSE_TIER2)
+    # 三类
+    return (3, *EXPENSE_TIER3)
+
+
+def parse_city_from_tag(tag):
+    """从标签名解析城市名, 支持格式: 城市_日期 或 出差_城市_日期"""
+    if not tag:
+        return ''
+    parts = tag.split('_')
+    if not parts:
+        return ''
+    # 第一段如果不是纯中文标签(如"出差"),则视为城市名
+    first = parts[0].strip()
+    if first in ('出差', '差旅'):
+        # 旧格式: 出差_城市_日期
+        return parts[1] if len(parts) >= 2 else ''
+    # 新格式: 城市_日期
+    return first
 
 
 # ---------------- 工具函数 ----------------
@@ -79,7 +139,7 @@ def db_init():
             """CREATE TABLE IF NOT EXISTS trips (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 trip_date TEXT NOT NULL,
-                weekday TEXT DEFAULT '',
+                weekday TEXT DEFAULT '', 
                 depart TEXT DEFAULT '',
                 arrive TEXT DEFAULT '',
                 transport TEXT DEFAULT '',
@@ -134,6 +194,46 @@ def db_init():
             conn.execute("ALTER TABLE trips ADD COLUMN invoice TEXT DEFAULT ''")
         except Exception:
             pass
+        # 为四张表增加出差标签列(幂等)
+        for _tbl in ('trips', 'lodging', 'meals', 'transports'):
+            try:
+                conn.execute("ALTER TABLE %s ADD COLUMN trip_tag TEXT DEFAULT ''" % _tbl)
+            except Exception:
+                pass
+        # 附件表
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS trip_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trip_id INTEGER NOT NULL,
+                file_type TEXT NOT NULL DEFAULT 'invoice',
+                file_path TEXT NOT NULL,
+                file_name TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            )"""
+        )
+        # 将 trips.invoice 旧字段数据迁移到 trip_files(幂等)
+        rows = conn.execute("SELECT id, invoice FROM trips WHERE invoice IS NOT NULL AND invoice != ''").fetchall()
+        for r in rows:
+            exists = conn.execute(
+                "SELECT 1 FROM trip_files WHERE trip_id=? AND file_path=?", (r['id'], r['invoice'])
+            ).fetchone()
+            if not exists:
+                old_name = os.path.basename(r['invoice'])
+                conn.execute(
+                    "INSERT INTO trip_files (trip_id, file_type, file_path, file_name) VALUES (?,?,?,?)",
+                    (r['id'], 'invoice', r['invoice'], old_name)
+                )
+        # 住宿附件表
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS lodging_files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lodging_id INTEGER NOT NULL,
+                file_type TEXT NOT NULL DEFAULT 'invoice',
+                file_path TEXT NOT NULL,
+                file_name TEXT DEFAULT '',
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            )"""
+        )
         conn.commit()
     finally:
         conn.close()
@@ -144,12 +244,12 @@ def add_trip(data):
     try:
         cur = conn.execute(
             """INSERT INTO trips (trip_date, weekday, depart, arrive, transport, cost,
-                meal_flag, meal_screenshot, public_flag, public_screenshot, invoice)
+                meal_flag, meal_screenshot, public_flag, public_screenshot, trip_tag)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (data['trip_date'], data['weekday'], data['depart'], data['arrive'],
              data['transport'], data['cost'], data['meal_flag'],
              data['meal_screenshot'], data['public_flag'], data['public_screenshot'],
-             data.get('invoice', '')),
+             data.get('trip_tag', '')),
         )
         conn.commit()
         return cur.lastrowid
@@ -162,13 +262,12 @@ def update_trip(tid, data):
     try:
         conn.execute(
             """UPDATE trips SET trip_date=?, weekday=?, depart=?, arrive=?, transport=?,
-                cost=?, meal_flag=?, meal_screenshot=?, public_flag=?, public_screenshot=?,
-                invoice=?
+                cost=?, meal_flag=?, meal_screenshot=?, public_flag=?, public_screenshot=?, trip_tag=?
                WHERE id=?""",
             (data['trip_date'], data['weekday'], data['depart'], data['arrive'],
              data['transport'], data['cost'], data['meal_flag'],
              data['meal_screenshot'], data['public_flag'], data['public_screenshot'],
-             data.get('invoice', ''), tid),
+             data.get('trip_tag', ''), tid),
         )
         conn.commit()
     finally:
@@ -184,7 +283,7 @@ def get_trip(tid):
 
 
 def delete_trip(tid, delete_files):
-    """删除记录;delete_files 为真时同时删除关联截图文件"""
+    """删除记录;delete_files 为真时同时删除关联截图和附件文件"""
     rec = get_trip(tid)
     if rec is None:
         return
@@ -196,15 +295,19 @@ def delete_trip(tid, delete_files):
                     os.remove(path)
                 except OSError:
                     pass
+        # 删除附件文件
+        for f in get_trip_files(tid):
+            remove_screenshot_file(f['file_path'])
     conn = get_conn()
     try:
+        conn.execute('DELETE FROM trip_files WHERE trip_id=?', (tid,))
         conn.execute('DELETE FROM trips WHERE id=?', (tid,))
         conn.commit()
     finally:
         conn.close()
 
 
-def query_trips(date_from='', date_to='', keyword=''):
+def query_trips(date_from='', date_to='', keyword='', tag=''):
     """按日期区间与关键字查询,日期倒序"""
     sql = 'SELECT * FROM trips WHERE 1=1'
     args = []
@@ -218,6 +321,9 @@ def query_trips(date_from='', date_to='', keyword=''):
         kw = '%' + keyword.strip().replace('%', '%%').replace('_', '\\_') + '%'
         sql += " AND (depart LIKE ? ESCAPE '\\' OR arrive LIKE ? ESCAPE '\\' OR transport LIKE ? ESCAPE '\\')"
         args.extend([kw, kw, kw])
+    if tag:
+        sql += ' AND trip_tag = ?'
+        args.append(tag)
     sql += ' ORDER BY trip_date DESC, id DESC'
     conn = get_conn()
     try:
@@ -226,15 +332,150 @@ def query_trips(date_from='', date_to='', keyword=''):
         conn.close()
 
 
+# ---------- 附件管理(trip_files) ----------
+
+def add_trip_file(trip_id, file_type, file_path, file_name=''):
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            'INSERT INTO trip_files (trip_id, file_type, file_path, file_name) VALUES (?,?,?,?)',
+            (trip_id, file_type, file_path, file_name),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_trip_files(trip_id):
+    conn = get_conn()
+    try:
+        return conn.execute(
+            'SELECT * FROM trip_files WHERE trip_id=? ORDER BY id', (trip_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def delete_trip_file(fid, delete_file=True):
+    if delete_file:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                'SELECT file_path FROM trip_files WHERE id=?', (fid,)
+            ).fetchone()
+            if row:
+                remove_screenshot_file(row['file_path'])
+        finally:
+            conn.close()
+    conn = get_conn()
+    try:
+        conn.execute('DELETE FROM trip_files WHERE id=?', (fid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_trip_file_counts(trip_ids):
+    """批量获取行程的附件数量,返回 {trip_id: {'invoice': N, 'itinerary': N}}"""
+    if not trip_ids:
+        return {}
+    placeholders = ','.join('?' * len(trip_ids))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            'SELECT trip_id, file_type, COUNT(*) as cnt FROM trip_files '
+            'WHERE trip_id IN (%s) GROUP BY trip_id, file_type' % placeholders,
+            trip_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+    result = {}
+    for r in rows:
+        tid = r['trip_id']
+        if tid not in result:
+            result[tid] = {'invoice': 0, 'itinerary': 0}
+        result[tid][r['file_type']] = r['cnt']
+    return result
+
+
+# ---------- 住宿附件管理(lodging_files) ----------
+
+def add_lodging_file(lodging_id, file_type, file_path, file_name=''):
+    conn = get_conn()
+    try:
+        cur = conn.execute(
+            'INSERT INTO lodging_files (lodging_id, file_type, file_path, file_name) VALUES (?,?,?,?)',
+            (lodging_id, file_type, file_path, file_name),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_lodging_files(lodging_id):
+    conn = get_conn()
+    try:
+        return conn.execute(
+            'SELECT * FROM lodging_files WHERE lodging_id=? ORDER BY id', (lodging_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def delete_lodging_file(fid, delete_file=True):
+    if delete_file:
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                'SELECT file_path FROM lodging_files WHERE id=?', (fid,)
+            ).fetchone()
+            if row:
+                remove_screenshot_file(row['file_path'])
+        finally:
+            conn.close()
+    conn = get_conn()
+    try:
+        conn.execute('DELETE FROM lodging_files WHERE id=?', (fid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_lodging_file_counts(lodging_ids):
+    """批量获取住宿的附件数量,返回 {lodging_id: {'invoice': N, 'receipt': N}}"""
+    if not lodging_ids:
+        return {}
+    placeholders = ','.join('?' * len(lodging_ids))
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            'SELECT lodging_id, file_type, COUNT(*) as cnt FROM lodging_files '
+            'WHERE lodging_id IN (%s) GROUP BY lodging_id, file_type' % placeholders,
+            lodging_ids,
+        ).fetchall()
+    finally:
+        conn.close()
+    result = {}
+    for r in rows:
+        lid = r['lodging_id']
+        if lid not in result:
+            result[lid] = {'invoice': 0, 'receipt': 0}
+        result[lid][r['file_type']] = r['cnt']
+    return result
+
+
 # ---------------- 住宿层 ----------------
 
 def add_lodging(data):
     conn = get_conn()
     try:
         cur = conn.execute(
-            """INSERT INTO lodging (checkin_date, checkout_date, hotel, amount)
-               VALUES (?, ?, ?, ?)""",
-            (data['checkin_date'], data['checkout_date'], data['hotel'], data['amount']),
+            """INSERT INTO lodging (checkin_date, checkout_date, hotel, amount, trip_tag)
+               VALUES (?, ?, ?, ?, ?)""",
+            (data['checkin_date'], data['checkout_date'], data['hotel'], data['amount'],
+             data.get('trip_tag', '')),
         )
         conn.commit()
         return cur.lastrowid
@@ -246,9 +487,10 @@ def update_lodging(lid, data):
     conn = get_conn()
     try:
         conn.execute(
-            """UPDATE lodging SET checkin_date=?, checkout_date=?, hotel=?, amount=?
+            """UPDATE lodging SET checkin_date=?, checkout_date=?, hotel=?, amount=?, trip_tag=?
                WHERE id=?""",
-            (data['checkin_date'], data['checkout_date'], data['hotel'], data['amount'], lid),
+            (data['checkin_date'], data['checkout_date'], data['hotel'], data['amount'],
+             data.get('trip_tag', ''), lid),
         )
         conn.commit()
     finally:
@@ -264,15 +506,20 @@ def get_lodging(lid):
 
 
 def delete_lodging(lid):
+    """删除住宿记录及其附件文件"""
+    # 删除附件文件
+    for f in get_lodging_files(lid):
+        remove_screenshot_file(f['file_path'])
     conn = get_conn()
     try:
+        conn.execute('DELETE FROM lodging_files WHERE lodging_id=?', (lid,))
         conn.execute('DELETE FROM lodging WHERE id=?', (lid,))
         conn.commit()
     finally:
         conn.close()
 
 
-def query_lodging(date_from='', date_to='', keyword=''):
+def query_lodging(date_from='', date_to='', keyword='', tag=''):
     """住宿记录,按入住日期区间与酒店关键字筛选,入住日期倒序"""
     sql = 'SELECT * FROM lodging WHERE 1=1'
     args = []
@@ -286,6 +533,9 @@ def query_lodging(date_from='', date_to='', keyword=''):
         kw = '%' + keyword.strip().replace('%', '%%').replace('_', '\\_') + '%'
         sql += " AND (hotel LIKE ? ESCAPE '\\')"
         args.append(kw)
+    if tag:
+        sql += ' AND trip_tag = ?'
+        args.append(tag)
     sql += ' ORDER BY checkin_date DESC, id DESC'
     conn = get_conn()
     try:
@@ -308,17 +558,16 @@ def get_lodging_history():
 # ---------------- 餐饮 / 交通层 ----------------
 
 MEAL_TYPES = ['早餐', '午餐', '晚餐', '下午茶', '夜宵', '其他']
-TRANSPORT_OPTIONS = ['公共交通', '打车', '公共交通+打车', '甲方提供', '我方租车']
 
 
 def add_meal(data):
     conn = get_conn()
     try:
         cur = conn.execute(
-            """INSERT INTO meals (meal_date, meal_type, place, amount, screenshot)
-               VALUES (?, ?, ?, ?, ?)""",
+            """INSERT INTO meals (meal_date, meal_type, place, amount, screenshot, trip_tag)
+               VALUES (?, ?, ?, ?, ?, ?)""",
             (data['meal_date'], data['meal_type'], data['place'], data['amount'],
-             data.get('screenshot', '')),
+             data.get('screenshot', ''), data.get('trip_tag', '')),
         )
         conn.commit()
         return cur.lastrowid
@@ -330,10 +579,10 @@ def update_meal(mid, data):
     conn = get_conn()
     try:
         conn.execute(
-            """UPDATE meals SET meal_date=?, meal_type=?, place=?, amount=?, screenshot=?
+            """UPDATE meals SET meal_date=?, meal_type=?, place=?, amount=?, screenshot=?, trip_tag=?
                WHERE id=?""",
             (data['meal_date'], data['meal_type'], data['place'], data['amount'],
-             data.get('screenshot', ''), mid),
+             data.get('screenshot', ''), data.get('trip_tag', ''), mid),
         )
         conn.commit()
     finally:
@@ -360,10 +609,22 @@ def delete_meal(mid):
         conn.close()
 
 
-def query_meals():
+def query_meals(date_from='', date_to='', tag=''):
+    sql = 'SELECT * FROM meals WHERE 1=1'
+    args = []
+    if date_from:
+        sql += ' AND meal_date >= ?'
+        args.append(date_from)
+    if date_to:
+        sql += ' AND meal_date <= ?'
+        args.append(date_to)
+    if tag:
+        sql += ' AND trip_tag = ?'
+        args.append(tag)
+    sql += ' ORDER BY meal_date DESC, id DESC'
     conn = get_conn()
     try:
-        return conn.execute('SELECT * FROM meals ORDER BY meal_date DESC, id DESC').fetchall()
+        return conn.execute(sql, args).fetchall()
     finally:
         conn.close()
 
@@ -381,10 +642,10 @@ def add_transport(data):
     conn = get_conn()
     try:
         cur = conn.execute(
-            """INSERT INTO transports (t_date, mode, depart, arrive, amount, public_flag, screenshot)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO transports (t_date, mode, depart, arrive, amount, public_flag, screenshot, trip_tag)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (data['t_date'], data['mode'], data['depart'], data['arrive'], data['amount'],
-             data['public_flag'], data.get('screenshot', '')),
+             data['public_flag'], data.get('screenshot', ''), data.get('trip_tag', '')),
         )
         conn.commit()
         return cur.lastrowid
@@ -396,10 +657,10 @@ def update_transport(tid, data):
     conn = get_conn()
     try:
         conn.execute(
-            """UPDATE transports SET t_date=?, mode=?, depart=?, arrive=?, amount=?, public_flag=?, screenshot=?
+            """UPDATE transports SET t_date=?, mode=?, depart=?, arrive=?, amount=?, public_flag=?, screenshot=?, trip_tag=?
                WHERE id=?""",
             (data['t_date'], data['mode'], data['depart'], data['arrive'], data['amount'],
-             data['public_flag'], data.get('screenshot', ''), tid),
+             data['public_flag'], data.get('screenshot', ''), data.get('trip_tag', ''), tid),
         )
         conn.commit()
     finally:
@@ -426,12 +687,22 @@ def delete_transport(trid):
         conn.close()
 
 
-def query_transports():
+def query_transports(date_from='', date_to='', tag=''):
+    sql = 'SELECT * FROM transports WHERE src_trip_id=0'
+    args = []
+    if date_from:
+        sql += ' AND t_date >= ?'
+        args.append(date_from)
+    if date_to:
+        sql += ' AND t_date <= ?'
+        args.append(date_to)
+    if tag:
+        sql += ' AND trip_tag = ?'
+        args.append(tag)
+    sql += ' ORDER BY t_date DESC, id DESC'
     conn = get_conn()
     try:
-        return conn.execute(
-            'SELECT * FROM transports WHERE src_trip_id=0 ORDER BY t_date DESC, id DESC'
-        ).fetchall()
+        return conn.execute(sql, args).fetchall()
     finally:
         conn.close()
 
@@ -488,11 +759,11 @@ def get_location_history():
 
 
 def save_screenshot(src_path, trip_date, tag):
-    """把选中的图片复制到 screenshots/日期/ 下,返回相对路径(正斜杠)"""
+    """把选中的图片/PDF复制到 screenshots/日期/ 下,返回相对路径(正斜杠)"""
     day_dir = os.path.join(SCREENSHOTS_DIR, trip_date)
     os.makedirs(day_dir, exist_ok=True)
     ext = os.path.splitext(src_path)[1].lower()
-    if ext not in IMG_EXTS:
+    if ext not in INVOICE_EXTS:
         ext = '.png'
     name = '%s_%s%s' % (tag, datetime.datetime.now().strftime('%H%M%S%f'), ext)
     dest = os.path.join(day_dir, name)
@@ -510,16 +781,83 @@ def remove_screenshot_file(rel_path):
             pass
 
 
+def get_all_tags():
+    """从四张表收集所有已使用的出差标签,去重,按最近使用排序"""
+    conn = get_conn()
+    try:
+        tags = set()
+        for tbl in ('trips', 'lodging', 'meals', 'transports'):
+            rows = conn.execute(
+                "SELECT DISTINCT trip_tag FROM %s WHERE trip_tag IS NOT NULL AND trip_tag != ''" % tbl
+            ).fetchall()
+            for r in rows:
+                tags.add(r[0])
+        return sorted(tags, reverse=True)
+    finally:
+        conn.close()
+
+
+def calc_trip_total(tag):
+    """计算指定标签的出差费用总额, 返回明细 dict"""
+    conn = get_conn()
+    try:
+        # 行程记录金额加总
+        r = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(cost),0) FROM trips WHERE trip_tag=?", (tag,)
+        ).fetchone()
+        trip_count, trip_total = r[0], r[1]
+
+        # 住宿记录金额加总
+        r = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount),0) FROM lodging WHERE trip_tag=?", (tag,)
+        ).fetchone()
+        lod_count, lod_total = r[0], r[1]
+
+        # 解析城市
+        city = parse_city_from_tag(tag)
+        tier, meal_rate, transit_rate = classify_city(city)
+        tier_names = {1: '一类', 2: '二类', 3: '三类'}
+
+        # 餐饮: 有截图的记录天数 × 餐费标准
+        meal_days = conn.execute(
+            "SELECT COUNT(DISTINCT meal_date) FROM meals WHERE trip_tag=? AND screenshot IS NOT NULL AND screenshot != ''",
+            (tag,)
+        ).fetchone()[0]
+        meal_cost = meal_days * meal_rate
+
+        # 市内交通: 有截图的记录天数 × 交通标准
+        transit_days = conn.execute(
+            "SELECT COUNT(DISTINCT t_date) FROM transports WHERE trip_tag=? AND screenshot IS NOT NULL AND screenshot != ''",
+            (tag,)
+        ).fetchone()[0]
+        transit_cost = transit_days * transit_rate
+
+        total = round(trip_total + lod_total + meal_cost + transit_cost, 2)
+        return {
+            'trip_total': round(trip_total, 2), 'trip_count': trip_count,
+            'lod_total': round(lod_total, 2), 'lod_count': lod_count,
+            'city': city, 'tier': tier, 'tier_name': tier_names[tier],
+            'meal_rate': meal_rate, 'meal_days': meal_days, 'meal_cost': meal_cost,
+            'transit_rate': transit_rate, 'transit_days': transit_days, 'transit_cost': transit_cost,
+            'total': total,
+        }
+    finally:
+        conn.close()
+
+
 # ---------------- 导出 Excel ----------------
 
 def export_to_excel(rows):
     """导出全部/筛选记录为 xlsx,返回 (文件路径, 条数)"""
     if not rows:
         return None, 0
+    # 批量获取附件计数
+    trip_ids = [r['id'] for r in rows]
+    file_counts = get_trip_file_counts(trip_ids)
     wb = Workbook()
     ws = wb.active
     ws.title = '行程记录'
-    headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式', '金额(元)', '发票']
+    headers = ['序号', '日期', '星期', '出发地', '到达地', '交通方式', '金额(元)', '发票', '行程单', '出差标签']
     ws.append(headers)
 
     header_fill = PatternFill('solid', fgColor='D9E1F2')
@@ -528,12 +866,15 @@ def export_to_excel(rows):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for i, r in enumerate(rows, 1):
+        fc = file_counts.get(r['id'], {'invoice': 0, 'itinerary': 0})
+        inv_text = '有(%d)' % fc['invoice'] if fc['invoice'] else ''
+        it_text = '有(%d)' % fc['itinerary'] if fc['itinerary'] else ''
         ws.append([i, r['trip_date'], r['weekday'], r['depart'], r['arrive'],
-                   r['transport'], r['cost'], '有' if r['invoice'] else ''])
+                   r['transport'], r['cost'], inv_text, it_text, r['trip_tag'] or ''])
 
     total_cost = round(sum(r['cost'] for r in rows), 2)
     total_row = ws.max_row + 1
-    ws.append(['', '', '', '', '', '总条数', total_cost, len(rows)])
+    ws.append(['', '', '', '', '', '总条数', total_cost, len(rows), '', ''])
 
     # 表头样式
     for cell in ws[1]:
@@ -555,7 +896,7 @@ def export_to_excel(rows):
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 9, 16, 16, 14, 12, 8]
+    widths = [6, 12, 9, 16, 16, 14, 12, 10, 10]
     for idx, w in enumerate(widths, 1):
         ws.column_dimensions[chr(64 + idx)].width = w
     ws.freeze_panes = 'A2'
@@ -570,10 +911,13 @@ def export_lodging_to_excel(rows):
     """导出全部住宿记录为 xlsx,返回 (文件路径, 条数)"""
     if not rows:
         return None, 0
+    # 批量获取附件计数
+    lod_ids = [r['id'] for r in rows]
+    file_counts = get_lodging_file_counts(lod_ids)
     wb = Workbook()
     ws = wb.active
     ws.title = '住宿记录'
-    headers = ['序号', '入住日期', '退房日期', '酒店名称', '金额(元)']
+    headers = ['序号', '入住日期', '退房日期', '酒店名称', '金额(元)', '发票', '水单', '出差标签']
     ws.append(headers)
 
     header_fill = PatternFill('solid', fgColor='D9E1F2')
@@ -582,11 +926,15 @@ def export_lodging_to_excel(rows):
     border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
     for i, r in enumerate(rows, 1):
-        ws.append([i, r['checkin_date'], r['checkout_date'], r['hotel'], r['amount']])
+        fc = file_counts.get(r['id'], {'invoice': 0, 'receipt': 0})
+        inv_text = '有(%d)' % fc['invoice'] if fc['invoice'] else ''
+        rec_text = '有(%d)' % fc['receipt'] if fc['receipt'] else ''
+        ws.append([i, r['checkin_date'], r['checkout_date'], r['hotel'], r['amount'],
+                   inv_text, rec_text, r['trip_tag'] or ''])
 
     total = sum(r['amount'] for r in rows)
     total_row = ws.max_row + 1
-    ws.append(['', '', '', '合计', round(total, 2)])
+    ws.append(['', '', '', '合计', round(total, 2), '', ''])
 
     for cell in ws[1]:
         cell.font = header_font
@@ -605,7 +953,7 @@ def export_lodging_to_excel(rows):
         cell.font = Font(bold=True)
         cell.fill = PatternFill('solid', fgColor='FCE4D6')
 
-    widths = [6, 12, 12, 30, 12]
+    widths = [6, 12, 12, 30, 12, 10, 10]
     for idx, w in enumerate(widths, 1):
         ws.column_dimensions[chr(64 + idx)].width = w
     ws.freeze_panes = 'A2'
@@ -643,12 +991,12 @@ def export_meals_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '餐饮记录'
-    headers = ['序号', '日期', '餐次', '用餐截图']
+    headers = ['序号', '日期', '餐次', '用餐截图', '出差标签']
     for i, r in enumerate(rows, 1):
-        ws.append([i, r['meal_date'], r['meal_type'], r['screenshot']])
-    _style_workbook(ws, rows, headers, ['', '', '共 %d 条' % len(rows), ''])
+        ws.append([i, r['meal_date'], r['meal_type'], r['screenshot'], r['trip_tag'] or ''])
+    _style_workbook(ws, rows, headers, ['', '', '共 %d 条' % len(rows), '', ''])
     ws.freeze_panes = 'A2'
-    for idx, w in enumerate([6, 12, 10, 40], 1):
+    for idx, w in enumerate([6, 12, 10, 40, 30], 1):
         ws.column_dimensions[chr(64 + idx)].width = w
     path = os.path.join(EXPORT_DIR, '餐饮记录_%s.xlsx' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     wb.save(path)
@@ -661,17 +1009,107 @@ def export_transports_to_excel(rows):
     wb = Workbook()
     ws = wb.active
     ws.title = '交通记录'
-    headers = ['序号', '日期', '出发地', '到达地', '金额(元)', '交通截图']
+    headers = ['序号', '日期', '出发地', '到达地', '金额(元)', '交通截图', '出差标签']
     for i, r in enumerate(rows, 1):
-        ws.append([i, r['t_date'], r['depart'], r['arrive'], r['amount'], r['screenshot']])
+        ws.append([i, r['t_date'], r['depart'], r['arrive'], r['amount'], r['screenshot'], r['trip_tag'] or ''])
     total = round(sum(r['amount'] for r in rows), 2)
-    _style_workbook(ws, rows, headers, ['', '', '', '合计', total, ''])
+    _style_workbook(ws, rows, headers, ['', '', '', '合计', total, '', ''])
     ws.freeze_panes = 'A2'
-    for idx, w in enumerate([6, 12, 16, 16, 12, 40], 1):
+    for idx, w in enumerate([6, 12, 16, 16, 12, 40, 30], 1):
         ws.column_dimensions[chr(64 + idx)].width = w
     path = os.path.join(EXPORT_DIR, '交通记录_%s.xlsx' % datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     wb.save(path)
     return path, len(rows)
+
+
+# ---------------- 行程单 PDF 解析 ----------------
+
+def parse_itinerary_pdf(pdf_path):
+    """解析高德打车行程单 PDF,返回 trip 列表:
+    [{'date': str, 'depart': str, 'arrive': str, 'cost': float}, ...]
+    使用 PyMuPDF dict 模式按列 x 坐标精确区分起点/终点。
+    """
+    try:
+        doc = fitz.open(pdf_path)
+        page_data = doc[0].get_text('dict')
+        doc.close()
+    except Exception:
+        return []
+
+    _DT = re.compile(r'\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}')
+    _AMT = re.compile(r'(\d+\.?\d*)元')
+
+    # 收集每个文本块的 span 列表: [(x0, text), ...]
+    def _block_spans(block):
+        result = []
+        for line in block.get('lines', []):
+            for span in line.get('spans', []):
+                t = span['text'].strip()
+                if t:
+                    result.append((span['bbox'][0], t))
+        return result
+
+    blocks = [b for b in page_data.get('blocks', []) if b.get('type') == 0]
+
+    # 1. 找到表头块, 提取列 x 坐标用于精确定位
+    city_x = None
+    depart_x = None
+    dest_x = None
+    hdr_idx = -1
+    for idx, block in enumerate(blocks):
+        spans = _block_spans(block)
+        if any(t == '序号' for _, t in spans):
+            for x, t in spans:
+                if t == '城市':
+                    city_x = x
+                elif t == '起点':
+                    depart_x = x
+                elif t == '终点':
+                    dest_x = x
+            hdr_idx = idx
+            break
+    if depart_x is None or dest_x is None or hdr_idx < 0:
+        return []
+    # 用表头列坐标的中点作为数据分类边界
+    left_x = (city_x + depart_x) / 2 if city_x else depart_x - 30
+    mid_x = (depart_x + dest_x) / 2
+
+    # 2. 解析表头之后的数据块
+    trips = []
+    for block in blocks[hdr_idx + 1:]:
+        spans = _block_spans(block)
+        if not spans or not spans[0][1].isdigit():
+            continue
+
+        # 提取上车时间
+        date_str = None
+        for _, t in spans:
+            m = _DT.search(t)
+            if m:
+                date_str = m.group()[:10]
+                break
+
+        # 按 x 坐标拆分起点/终点, 提取金额
+        depart_parts = []
+        arrive_parts = []
+        cost = None
+        for x, t in spans:
+            if _AMT.match(t):
+                cost = float(_AMT.match(t).group(1))
+            elif x >= mid_x:
+                arrive_parts.append(t)
+            elif x >= left_x:  # 起点列
+                depart_parts.append(t)
+
+        if date_str and depart_parts and cost is not None:
+            trips.append({
+                'date': date_str,
+                'depart': ''.join(depart_parts),
+                'arrive': ''.join(arrive_parts),
+                'cost': cost,
+            })
+
+    return trips
 
 
 # ---------------- 新增/编辑对话框 ----------------
@@ -696,16 +1134,23 @@ class EditDialog(tk.Toplevel):
         self.transport_var = tk.StringVar(value=self.record.get('transport') or '')
         cost = self.record.get('cost')
         self.cost_var = tk.StringVar(value=('%g' % cost) if cost else '')
+        self.tag_var = tk.StringVar(value=self.record.get('trip_tag') or '')
 
-        # 发票: 编辑时已入库的相对路径 / 新选择的源路径
-        self.old_invoice = self.record.get('invoice') or ''
-        self.new_invoice_src = ''
-        self.invoice_thumb = None
+        # 附件: {id: {type, path, name}} 已入库文件
+        self.att_files = {}
+        # 待保存新文件: [(file_type, src_abs_path)]
+        self.pending_files = []
+        # 已删除的文件 id(编辑时)
+        self.deleted_fids = []
+        if is_edit:
+            for f in get_trip_files(self.record['id']):
+                self.att_files[f['id']] = {
+                    'type': f['file_type'], 'path': f['file_path'], 'name': f['file_name'],
+                }
 
         self._build()
         self._update_weekday()
-        if self.old_invoice:
-            self._preview_invoice(rel_to_abs(self.old_invoice))
+        self._refresh_file_lists()
 
         # 居中显示
         self.update_idletasks()
@@ -754,14 +1199,37 @@ class EditDialog(tk.Toplevel):
         ttk.Label(row, text='金额(元)').pack(side='left')
         ttk.Entry(row, textvariable=self.cost_var, width=12).pack(side='left', padx=(6, 0))
 
-        # 发票上传
-        inv_box = ttk.LabelFrame(body, text='发票上传', padding=8)
+        # --- 发票 ---
+        inv_box = ttk.LabelFrame(body, text='发票', padding=6)
         inv_box.pack(fill='x', **pad)
-        self.inv_btn = ttk.Button(inv_box, text='选择发票', width=10, command=self._pick_invoice)
-        self.inv_btn.pack(side='left')
-        self.inv_label = ttk.Label(inv_box, text='已上传' if self.old_invoice else '未选择发票',
-                                   foreground='#666666')
-        self.inv_label.pack(side='left', padx=(10, 0))
+        inv_top = ttk.Frame(inv_box)
+        inv_top.pack(fill='x')
+        ttk.Button(inv_top, text='上传发票', width=10,
+                   command=lambda: self._pick_files('invoice')).pack(side='left')
+        self.inv_count_lbl = ttk.Label(inv_top, text='', foreground='#666666')
+        self.inv_count_lbl.pack(side='left', padx=(10, 0))
+        self.inv_list_frame = ttk.Frame(inv_box)
+        self.inv_list_frame.pack(fill='x', pady=(4, 0))
+
+        # --- 电子行程单 ---
+        it_box = ttk.LabelFrame(body, text='电子行程单', padding=6)
+        it_box.pack(fill='x', **pad)
+        it_top = ttk.Frame(it_box)
+        it_top.pack(fill='x')
+        ttk.Button(it_top, text='上传行程单', width=10,
+                   command=lambda: self._pick_files('itinerary')).pack(side='left')
+        ttk.Button(it_top, text='识别行程单', width=10,
+                   command=self._ocr_itinerary).pack(side='left', padx=(6, 0))
+        self.it_count_lbl = ttk.Label(it_top, text='', foreground='#666666')
+        self.it_count_lbl.pack(side='left', padx=(10, 0))
+        self.it_list_frame = ttk.Frame(it_box)
+        self.it_list_frame.pack(fill='x', pady=(4, 0))
+
+        # 出差标签
+        row = ttk.Frame(body)
+        row.pack(fill='x', **pad)
+        ttk.Label(row, text='出差标签').pack(side='left')
+        ttk.Combobox(row, textvariable=self.tag_var, values=get_all_tags(), width=30).pack(side='left', padx=(6, 0))
 
         # 按钮行
         row = ttk.Frame(body)
@@ -778,24 +1246,92 @@ class EditDialog(tk.Toplevel):
         d = parse_date(self.date_var.get())
         self.weekday_var.set(weekday_of(self.date_var.get()) if d else '日期格式: YYYY-MM-DD')
 
-    def _pick_invoice(self):
-        path = filedialog.askopenfilename(
-            title='选择发票图片', parent=self,
-            filetypes=[('图片文件', '*.png *.jpg *.jpeg *.bmp *.gif *.webp'), ('所有文件', '*.*')])
-        if not path:
+    def _pick_files(self, file_type):
+        """选择多个文件"""
+        title = '选择发票' if file_type == 'invoice' else '选择电子行程单'
+        paths = filedialog.askopenfilenames(
+            title=title, parent=self,
+            filetypes=[('发票文件', '*.png *.jpg *.jpeg *.bmp *.gif *.webp *.pdf'),
+                       ('图片文件', '*.png *.jpg *.jpeg *.bmp *.gif *.webp'),
+                       ('PDF文件', '*.pdf'), ('所有文件', '*.*')])
+        if not paths:
             return
-        self.new_invoice_src = path
-        self._preview_invoice(path)
+        for p in paths:
+            self.pending_files.append((file_type, p))
+        self._refresh_file_lists()
 
-    def _preview_invoice(self, path):
-        try:
-            img = Image.open(path)
-            img.thumbnail((150, 100))
-            photo = ImageTk.PhotoImage(img)
-            self.inv_label.configure(image=photo, text='')
-            self.invoice_thumb = photo
-        except Exception:
-            self.inv_label.configure(image='', text='已选择发票(无法预览)')
+    def _refresh_file_lists(self):
+        """刷新两个附件列表"""
+        for ft, frame, count_lbl, tag in [
+            ('invoice', self.inv_list_frame, self.inv_count_lbl, '发票'),
+            ('itinerary', self.it_list_frame, self.it_count_lbl, '行程单'),
+        ]:
+            for w in frame.winfo_children():
+                w.destroy()
+            items = [(fid, v) for fid, v in self.att_files.items() if v['type'] == ft]
+            pending = [(i, v) for i, v in enumerate(self.pending_files) if v[0] == ft]
+            count = len(items) + len(pending)
+            count_lbl.configure(text='%d 个文件' % count if count else '未上传')
+            for fid, v in items:
+                row = ttk.Frame(frame)
+                row.pack(fill='x', pady=1)
+                name = v['name'] or os.path.basename(v['path'])
+                if len(name) > 30:
+                    name = name[:27] + '...'
+                ttk.Label(row, text=name, foreground='#333333').pack(side='left')
+                ttk.Button(row, text='移除', width=4,
+                           command=lambda fid=fid: self._remove_existing(fid)).pack(side='left', padx=(8, 0))
+            for pi, (ft2, src) in enumerate(self.pending_files):
+                if ft2 != ft:
+                    continue
+                row = ttk.Frame(frame)
+                row.pack(fill='x', pady=1)
+                name = os.path.basename(src)
+                if len(name) > 30:
+                    name = name[:27] + '...'
+                ttk.Label(row, text='[新] ' + name, foreground='#0563C1').pack(side='left')
+                ttk.Button(row, text='移除', width=4,
+                           command=lambda pi=pi: self._remove_pending(pi)).pack(side='left', padx=(8, 0))
+
+    def _remove_existing(self, fid):
+        """标记已入库文件为删除"""
+        self.deleted_fids.append(fid)
+        del self.att_files[fid]
+        self._refresh_file_lists()
+
+    def _remove_pending(self, idx):
+        """移除待保存文件"""
+        if 0 <= idx < len(self.pending_files):
+            self.pending_files.pop(idx)
+        self._refresh_file_lists()
+
+    def _ocr_itinerary(self):
+        """从已上传的行程单 PDF 中解析打车信息,自动填充表单"""
+        pdfs = [(i, src) for i, (ft, src) in enumerate(self.pending_files)
+                if ft == 'itinerary' and src.lower().endswith('.pdf')]
+        if not pdfs:
+            messagebox.showinfo('提示', '请先上传行程单 PDF 文件', parent=self)
+            return
+
+        all_trips = []
+        for _, src in pdfs:
+            all_trips.extend(parse_itinerary_pdf(src))
+
+        if not all_trips:
+            messagebox.showwarning('提示', '未能从行程单中识别到有效行程信息', parent=self)
+            return
+
+        t = all_trips[0]
+        self.date_var.set(t['date'])
+        self._update_weekday()
+        self.depart_var.set(t['depart'])
+        self.arrive_var.set(t['arrive'])
+        self.transport_var.set('打车')
+        self.cost_var.set('%g' % t['cost'])
+
+        n = len(all_trips)
+        msg = '已识别并填充行程信息' + (' (共 %d 条,已填入第 1 条)' % n if n > 1 else '')
+        messagebox.showinfo('识别成功', msg, parent=self)
 
     def _save(self):
         date_str = self.date_var.get().strip()
@@ -818,15 +1354,6 @@ class EditDialog(tk.Toplevel):
             except ValueError:
                 messagebox.showwarning('提示', '金额请输入数字', parent=self)
                 return
-        # 发票处理
-        if self.new_invoice_src:
-            invoice = save_screenshot(self.new_invoice_src, d.isoformat(), 'invoice')
-            if self.old_invoice:
-                remove_screenshot_file(self.old_invoice)
-        elif self.old_invoice:
-            invoice = self.old_invoice
-        else:
-            invoice = ''
 
         date_iso = d.isoformat()
         data = {
@@ -840,12 +1367,26 @@ class EditDialog(tk.Toplevel):
             'meal_screenshot': '',
             'public_flag': 0,
             'public_screenshot': '',
-            'invoice': invoice,
+            'trip_tag': self.tag_var.get().strip(),
         }
+
         if self.record:
-            update_trip(self.record['id'], data)
+            # 编辑: 直接操作数据库
+            tid = self.record['id']
+            update_trip(tid, data)
+            # 删除已标记的文件
+            for fid in self.deleted_fids:
+                delete_trip_file(fid, delete_file=True)
+            # 保存新文件
+            for ft, src in self.pending_files:
+                rel = save_screenshot(src, date_iso, ft)
+                add_trip_file(tid, ft, rel, os.path.basename(src))
         else:
-            add_trip(data)
+            # 新增: 先创建行程再保存附件
+            tid = add_trip(data)
+            for ft, src in self.pending_files:
+                rel = save_screenshot(src, date_iso, ft)
+                add_trip_file(tid, ft, rel, os.path.basename(src))
         self.destroy()
 
 
@@ -867,8 +1408,20 @@ class LodgingDialog(tk.Toplevel):
         self.hotel_var = tk.StringVar(value=self.record.get('hotel') or '')
         amt = self.record.get('amount')
         self.amount_var = tk.StringVar(value=('%g' % amt) if amt else '')
+        self.tag_var = tk.StringVar(value=self.record.get('trip_tag') or '')
+
+        # 附件: {id: {type, path, name}}
+        self.att_files = {}
+        self.pending_files = []
+        self.deleted_fids = []
+        if is_edit:
+            for f in get_lodging_files(self.record['id']):
+                self.att_files[f['id']] = {
+                    'type': f['file_type'], 'path': f['file_path'], 'name': f['file_name'],
+                }
 
         self._build()
+        self._refresh_file_lists()
         self.update_idletasks()
         x = master.winfo_rootx() + (master.winfo_width() - self.winfo_width()) // 2
         y = master.winfo_rooty() + (master.winfo_height() - self.winfo_height()) // 2
@@ -903,11 +1456,97 @@ class LodgingDialog(tk.Toplevel):
         ttk.Label(row, text='金额(元) *').pack(side='left')
         ttk.Entry(row, textvariable=self.amount_var, width=12).pack(side='left', padx=(6, 0))
 
+        # --- 发票 ---
+        inv_box = ttk.LabelFrame(body, text='发票', padding=6)
+        inv_box.pack(fill='x', **pad)
+        inv_top = ttk.Frame(inv_box)
+        inv_top.pack(fill='x')
+        ttk.Button(inv_top, text='上传发票', width=10,
+                   command=lambda: self._pick_files('invoice')).pack(side='left')
+        self.inv_count_lbl = ttk.Label(inv_top, text='', foreground='#666666')
+        self.inv_count_lbl.pack(side='left', padx=(10, 0))
+        self.inv_list_frame = ttk.Frame(inv_box)
+        self.inv_list_frame.pack(fill='x', pady=(4, 0))
+
+        # --- 水单 ---
+        rec_box = ttk.LabelFrame(body, text='水单', padding=6)
+        rec_box.pack(fill='x', **pad)
+        rec_top = ttk.Frame(rec_box)
+        rec_top.pack(fill='x')
+        ttk.Button(rec_top, text='上传水单', width=10,
+                   command=lambda: self._pick_files('receipt')).pack(side='left')
+        self.rec_count_lbl = ttk.Label(rec_top, text='', foreground='#666666')
+        self.rec_count_lbl.pack(side='left', padx=(10, 0))
+        self.rec_list_frame = ttk.Frame(rec_box)
+        self.rec_list_frame.pack(fill='x', pady=(4, 0))
+
+        # 出差标签
+        row = ttk.Frame(body)
+        row.pack(fill='x', **pad)
+        ttk.Label(row, text='出差标签').pack(side='left')
+        ttk.Combobox(row, textvariable=self.tag_var, values=get_all_tags(), width=30).pack(side='left', padx=(6, 0))
+
         # 按钮行
         row = ttk.Frame(body)
         row.pack(fill='x', pady=(12, 0))
         ttk.Button(row, text='保存', width=10, command=self._save).pack(side='right', padx=(8, 0))
         ttk.Button(row, text='取消', width=10, command=self.destroy).pack(side='right')
+
+    # ---------- 附件操作 ----------
+    def _pick_files(self, file_type):
+        title = '选择发票' if file_type == 'invoice' else '选择水单'
+        paths = filedialog.askopenfilenames(
+            title=title, parent=self,
+            filetypes=[('发票文件', '*.png *.jpg *.jpeg *.bmp *.gif *.webp *.pdf'),
+                       ('图片文件', '*.png *.jpg *.jpeg *.bmp *.gif *.webp'),
+                       ('PDF文件', '*.pdf'), ('所有文件', '*.*')])
+        if not paths:
+            return
+        for p in paths:
+            self.pending_files.append((file_type, p))
+        self._refresh_file_lists()
+
+    def _refresh_file_lists(self):
+        for ft, frame, count_lbl, tag in [
+            ('invoice', self.inv_list_frame, self.inv_count_lbl, '发票'),
+            ('receipt', self.rec_list_frame, self.rec_count_lbl, '水单'),
+        ]:
+            for w in frame.winfo_children():
+                w.destroy()
+            items = [(fid, v) for fid, v in self.att_files.items() if v['type'] == ft]
+            pending = [(pi, v) for pi, v in enumerate(self.pending_files) if v[0] == ft]
+            count = len(items) + len(pending)
+            count_lbl.configure(text='%d 个文件' % count if count else '未上传')
+            for fid, v in items:
+                row = ttk.Frame(frame)
+                row.pack(fill='x', pady=1)
+                name = v['name'] or os.path.basename(v['path'])
+                if len(name) > 30:
+                    name = name[:27] + '...'
+                ttk.Label(row, text=name, foreground='#333333').pack(side='left')
+                ttk.Button(row, text='移除', width=4,
+                           command=lambda fid=fid: self._remove_existing(fid)).pack(side='left', padx=(8, 0))
+            for pi, (ft2, src) in enumerate(self.pending_files):
+                if ft2 != ft:
+                    continue
+                row = ttk.Frame(frame)
+                row.pack(fill='x', pady=1)
+                name = os.path.basename(src)
+                if len(name) > 30:
+                    name = name[:27] + '...'
+                ttk.Label(row, text='[新] ' + name, foreground='#0563C1').pack(side='left')
+                ttk.Button(row, text='移除', width=4,
+                           command=lambda pi=pi: self._remove_pending(pi)).pack(side='left', padx=(8, 0))
+
+    def _remove_existing(self, fid):
+        self.deleted_fids.append(fid)
+        del self.att_files[fid]
+        self._refresh_file_lists()
+
+    def _remove_pending(self, idx):
+        if 0 <= idx < len(self.pending_files):
+            self.pending_files.pop(idx)
+        self._refresh_file_lists()
 
     def _save(self):
         cin = self.checkin_var.get().strip()
@@ -936,11 +1575,21 @@ class LodgingDialog(tk.Toplevel):
             'checkout_date': parse_date(cout).isoformat(),
             'hotel': hotel,
             'amount': amount,
+            'trip_tag': self.tag_var.get().strip(),
         }
         if self.record:
-            update_lodging(self.record['id'], data)
+            lid = self.record['id']
+            update_lodging(lid, data)
+            for fid in self.deleted_fids:
+                delete_lodging_file(fid, delete_file=True)
+            for ft, src in self.pending_files:
+                rel = save_screenshot(src, data['checkin_date'], 'lod_' + ft)
+                add_lodging_file(lid, ft, rel, os.path.basename(src))
         else:
-            add_lodging(data)
+            lid = add_lodging(data)
+            for ft, src in self.pending_files:
+                rel = save_screenshot(src, data['checkin_date'], 'lod_' + ft)
+                add_lodging_file(lid, ft, rel, os.path.basename(src))
         self.destroy()
 
 
@@ -958,6 +1607,7 @@ class MealDialog(tk.Toplevel):
         today = datetime.date.today().isoformat()
         self.date_var = tk.StringVar(value=self.record.get('meal_date') or today)
         self.type_var = tk.StringVar(value=self.record.get('meal_type') or '午餐')
+        self.tag_var = tk.StringVar(value=self.record.get('trip_tag') or '')
 
         # 截图: 编辑时已入库的相对路径 / 新选择的源路径
         self.old_shot = self.record.get('screenshot') or ''
@@ -993,6 +1643,11 @@ class MealDialog(tk.Toplevel):
         self.shot_btn.pack(side='left')
         self.shot_label = ttk.Label(shot_box, text='未选择截图', foreground='#999999')
         self.shot_label.pack(side='left', padx=(10, 0))
+
+        # 出差标签
+        row = ttk.Frame(body); row.pack(fill='x', **pad)
+        ttk.Label(row, text='出差标签').pack(side='left')
+        ttk.Combobox(row, textvariable=self.tag_var, values=get_all_tags(), width=30).pack(side='left', padx=(6, 0))
 
         row = ttk.Frame(body); row.pack(fill='x', pady=(12, 0))
         ttk.Button(row, text='保存', width=10, command=self._save).pack(side='right', padx=(8, 0))
@@ -1037,6 +1692,7 @@ class MealDialog(tk.Toplevel):
             'place': '',
             'amount': 0.0,
             'screenshot': shot,
+            'trip_tag': self.tag_var.get().strip(),
         }
         if self.record:
             update_meal(self.record['id'], data)
@@ -1064,6 +1720,7 @@ class TransportDialog(tk.Toplevel):
         amt = self.record.get('amount')
         self.amount_var = tk.StringVar(value=('%g' % amt) if amt else '')
         self._departs, self._arrives = departs, arrives
+        self.tag_var = tk.StringVar(value=self.record.get('trip_tag') or '')
         # 截图: 编辑时已入库的相对路径 / 新选择的源路径
         self.old_shot = self.record.get('screenshot') or ''
         self.new_src = ''
@@ -1105,6 +1762,11 @@ class TransportDialog(tk.Toplevel):
         self.shot_btn.pack(side='left')
         self.shot_label = ttk.Label(shot_box, text='未选择截图', foreground='#999999')
         self.shot_label.pack(side='left', padx=(10, 0))
+
+        # 出差标签
+        row = ttk.Frame(body); row.pack(fill='x', **pad)
+        ttk.Label(row, text='出差标签').pack(side='left')
+        ttk.Combobox(row, textvariable=self.tag_var, values=get_all_tags(), width=30).pack(side='left', padx=(6, 0))
 
         row = ttk.Frame(body); row.pack(fill='x', pady=(12, 0))
         ttk.Button(row, text='保存', width=10, command=self._save).pack(side='right', padx=(8, 0))
@@ -1160,6 +1822,7 @@ class TransportDialog(tk.Toplevel):
             'amount': amount,
             'public_flag': 0,
             'screenshot': shot,
+            'trip_tag': self.tag_var.get().strip(),
         }
         if self.record:
             update_transport(self.record['id'], data)
@@ -1187,12 +1850,32 @@ class MainApp(tk.Tk):
         self.date_to_var = tk.StringVar()
         self.keyword_var = tk.StringVar()
 
+        # 餐饮/交通日期筛选变量
+        self.meal_date_from_var = tk.StringVar()
+        self.meal_date_to_var = tk.StringVar()
+        self.tr_date_from_var = tk.StringVar()
+        self.tr_date_to_var = tk.StringVar()
+
+        # 标签筛选变量
+        self.trip_tag_var = tk.StringVar()
+        self.lod_tag_var = tk.StringVar()
+        self.meal_tag_var = tk.StringVar()
+        self.tr_tag_var = tk.StringVar()
+
         self._build_notebook()
+        self._build_calc_panel()
         self._build_statusbar()
 
         # 默认显示本月记录
-        self.date_from_var.set(datetime.date.today().replace(day=1).isoformat())
-        self.date_to_var.set(datetime.date.today().isoformat())
+        today = datetime.date.today()
+        first_of_month = today.replace(day=1).isoformat()
+        today_str = today.isoformat()
+        self.date_from_var.set(first_of_month)
+        self.date_to_var.set(today_str)
+        self.meal_date_from_var.set(first_of_month)
+        self.meal_date_to_var.set(today_str)
+        self.tr_date_from_var.set(first_of_month)
+        self.tr_date_to_var.set(today_str)
         self.refresh()
         self.refresh_lodging()
         self.refresh_meals()
@@ -1205,10 +1888,12 @@ class MainApp(tk.Tk):
 
         self.trip_tab = ttk.Frame(nb, padding=0)
         self.lod_tab = ttk.Frame(nb, padding=0)
-        self.mt_tab = ttk.Frame(nb, padding=0)
+        self.meal_tab = ttk.Frame(nb, padding=0)
+        self.tr_tab = ttk.Frame(nb, padding=0)
         nb.add(self.trip_tab, text='  行程记录  ')
         nb.add(self.lod_tab, text='  住宿记录  ')
-        nb.add(self.mt_tab, text='  餐饮 交通  ')
+        nb.add(self.meal_tab, text='  餐饮  ')
+        nb.add(self.tr_tab, text='  公共交通  ')
         self.notebook = nb
 
         self._build_toolbar()
@@ -1242,11 +1927,19 @@ class MainApp(tk.Tk):
         ent.pack(side='left', padx=(3, 0))
         ent.bind('<Return>', lambda e: self.refresh())
 
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
+        ttk.Label(bar, text='标签').pack(side='left')
+        tag_cbo = ttk.Combobox(bar, textvariable=self.trip_tag_var, values=get_all_tags(), width=24)
+        tag_cbo.pack(side='left', padx=(3, 0))
+        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh())
+
     # 表头顺序与固定列宽(与数据行对齐)
     HEAD_COLS = [
         ('date', '日期', 100), ('weekday', '星期', 70), ('depart', '出发地', 150),
         ('arrive', '到达地', 150), ('transport', '交通方式', 120),
         ('cost', '金额(元)', 100), ('invoice', '发票', 80),
+        ('itinerary', '行程单', 80),
+        ('tag', '标签', 150),
     ]
     DAY_BG = '#EAF1F8'
     DAY_BG_OPEN = '#D7E7F5'
@@ -1293,7 +1986,9 @@ class MainApp(tk.Tk):
     # ---------- 住宿记录区 ----------
     LOD_HEAD_COLS = [
         ('checkin', '入住日期', 120), ('checkout', '退房日期', 120),
-        ('hotel', '酒店名称', 300), ('amount', '金额(元)', 120),
+        ('hotel', '酒店名称', 260), ('amount', '金额(元)', 100),
+        ('invoice', '发票', 80), ('receipt', '水单', 80),
+        ('tag', '标签', 150),
     ]
     LOD_SEL_BG = '#BDD7EE'
 
@@ -1325,6 +2020,12 @@ class MainApp(tk.Tk):
         ent = ttk.Entry(bar, textvariable=self.lod_kw_var, width=14)
         ent.pack(side='left', padx=(3, 0))
         ent.bind('<Return>', lambda e: self.refresh_lodging())
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
+        ttk.Label(bar, text='标签').pack(side='left')
+        tag_cbo = ttk.Combobox(bar, textvariable=self.lod_tag_var, values=get_all_tags(), width=24)
+        tag_cbo.pack(side='left', padx=(3, 0))
+        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_lodging())
 
         body = ttk.Frame(wrap, padding=(0, 6, 0, 0))
         body.pack(fill='both', expand=True)
@@ -1371,9 +2072,19 @@ class MainApp(tk.Tk):
             if v and parse_date(v) is None:
                 messagebox.showwarning('提示', '住宿日期筛选格式应为 YYYY-MM-DD', parent=self)
                 return
-        rows = query_lodging(self.lod_from_var.get().strip(),
+        raw_rows = query_lodging(self.lod_from_var.get().strip(),
                              self.lod_to_var.get().strip(),
-                             self.lod_kw_var.get().strip())
+                             self.lod_kw_var.get().strip(),
+                             self.lod_tag_var.get().strip())
+        # sqlite3.Row 只读,转为 dict
+        rows = [dict(r) for r in raw_rows]
+        # 批量获取附件计数
+        lod_ids = [r['id'] for r in rows]
+        file_counts = get_lodging_file_counts(lod_ids)
+        for r in rows:
+            fc = file_counts.get(r['id'], {'invoice': 0, 'receipt': 0})
+            r['inv_cnt'] = fc['invoice']
+            r['rec_cnt'] = fc['receipt']
         inner = self.lod_inner
         for child in inner.grid_slaves():
             try:
@@ -1412,27 +2123,18 @@ class MainApp(tk.Tk):
     # ---------- 餐饮 交通 区 ----------
     MEAL_HEAD_COLS = [
         ('date', '日期', 150), ('type', '餐次', 120), ('shot', '用餐截图', 200),
+        ('tag', '标签', 150),
     ]
     TR_HEAD_COLS = [
         ('date', '日期', 120),
         ('depart', '出发地', 180), ('arrive', '到达地', 180),
         ('amount', '金额(元)', 120), ('shot', '交通截图', 140),
+        ('tag', '标签', 150),
     ]
 
     def _build_meal_transport(self):
-        outer = ttk.Frame(self.mt_tab, padding=(10, 8, 10, 4))
-        outer.pack(fill='both', expand=True)
-        inner_nb = ttk.Notebook(outer)
-        inner_nb.pack(fill='both', expand=True)
-
-        meal_tab = ttk.Frame(inner_nb, padding=0)
-        tr_tab = ttk.Frame(inner_nb, padding=0)
-        inner_nb.add(meal_tab, text='  餐饮  ')
-        inner_nb.add(tr_tab, text='  交通  ')
-        self.mt_notebook = inner_nb
-
-        self._build_meal_panel(meal_tab)
-        self._build_transport_panel(tr_tab)
+        self._build_meal_panel(self.meal_tab)
+        self._build_transport_panel(self.tr_tab)
 
     # ---- 餐饮子页 ----
     def _build_meal_panel(self, tab):
@@ -1440,6 +2142,22 @@ class MainApp(tk.Tk):
         ttk.Button(bar, text='＋ 新增餐饮', command=self._add_meal).pack(side='left')
         ttk.Button(bar, text='导出 Excel', command=self._export_meals).pack(side='left', padx=(6, 0))
         ttk.Button(bar, text='删除所选', command=self._delete_meal_selected).pack(side='left', padx=(6, 0))
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
+
+        ttk.Label(bar, text='从').pack(side='left')
+        ttk.Entry(bar, textvariable=self.meal_date_from_var, width=12).pack(side='left', padx=(3, 0))
+        ttk.Label(bar, text='至').pack(side='left', padx=(6, 0))
+        ttk.Entry(bar, textvariable=self.meal_date_to_var, width=12).pack(side='left', padx=(3, 0))
+        ttk.Button(bar, text='本月', width=6, command=self._set_meal_month).pack(side='left', padx=(6, 0))
+        ttk.Button(bar, text='查询', width=6, command=self.refresh_meals).pack(side='left', padx=(6, 0))
+        ttk.Button(bar, text='清除', width=6, command=self._clear_meal_filter).pack(side='left', padx=(3, 0))
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
+        ttk.Label(bar, text='标签').pack(side='left')
+        tag_cbo = ttk.Combobox(bar, textvariable=self.meal_tag_var, values=get_all_tags(), width=24)
+        tag_cbo.pack(side='left', padx=(3, 0))
+        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_meals())
 
         body = ttk.Frame(tab, padding=(0, 4, 0, 0))
         body.pack(fill='both', expand=True)
@@ -1473,7 +2191,14 @@ class MainApp(tk.Tk):
         self.meal_canvas.yview_scroll(int(-event.delta / 120), 'units')
 
     def refresh_meals(self):
-        rows = query_meals()
+        date_from = self.meal_date_from_var.get().strip()
+        date_to = self.meal_date_to_var.get().strip()
+        for var in (self.meal_date_from_var, self.meal_date_to_var):
+            val = var.get().strip()
+            if val and parse_date(val) is None:
+                messagebox.showwarning('提示', '日期筛选格式应为 YYYY-MM-DD', parent=self)
+                return
+        rows = query_meals(date_from or '', date_to or '', self.meal_tag_var.get().strip())
         inner = self.meal_inner
         for child in inner.grid_slaves():
             try:
@@ -1496,7 +2221,8 @@ class MainApp(tk.Tk):
 
     def _insert_meal_row(self, parent, row, rec):
         values = (rec['meal_date'], rec['meal_type'] or '—',
-                  '有截图' if rec['screenshot'] else '—')
+                  '有截图' if rec['screenshot'] else '—',
+                  rec['trip_tag'] or '—')
         bg = self.SEL_BG if self.cur_meal_id == rec['id'] else '#FFFFFF'
         cells = []
         for i, v in enumerate(values):
@@ -1522,7 +2248,9 @@ class MainApp(tk.Tk):
             MealDialog(self, dict(rec))
 
     def _export_meals(self):
-        rows = query_meals()
+        rows = query_meals(self.meal_date_from_var.get().strip() or '',
+                           self.meal_date_to_var.get().strip() or '',
+                           self.meal_tag_var.get().strip())
         path, n = export_meals_to_excel(rows)
         if path is None:
             messagebox.showinfo('导出', '当前没有餐饮记录可导出', parent=self); return
@@ -1554,6 +2282,22 @@ class MainApp(tk.Tk):
         ttk.Button(bar, text='＋ 新增交通', command=self._add_transport).pack(side='left')
         ttk.Button(bar, text='导出 Excel', command=self._export_transports).pack(side='left', padx=(6, 0))
         ttk.Button(bar, text='删除所选', command=self._delete_transport_selected).pack(side='left', padx=(6, 0))
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
+
+        ttk.Label(bar, text='从').pack(side='left')
+        ttk.Entry(bar, textvariable=self.tr_date_from_var, width=12).pack(side='left', padx=(3, 0))
+        ttk.Label(bar, text='至').pack(side='left', padx=(6, 0))
+        ttk.Entry(bar, textvariable=self.tr_date_to_var, width=12).pack(side='left', padx=(3, 0))
+        ttk.Button(bar, text='本月', width=6, command=self._set_tr_month).pack(side='left', padx=(6, 0))
+        ttk.Button(bar, text='查询', width=6, command=self.refresh_transports).pack(side='left', padx=(6, 0))
+        ttk.Button(bar, text='清除', width=6, command=self._clear_tr_filter).pack(side='left', padx=(3, 0))
+
+        ttk.Separator(bar, orient='vertical').pack(side='left', fill='y', padx=12)
+        ttk.Label(bar, text='标签').pack(side='left')
+        tag_cbo = ttk.Combobox(bar, textvariable=self.tr_tag_var, values=get_all_tags(), width=24)
+        tag_cbo.pack(side='left', padx=(3, 0))
+        tag_cbo.bind('<<ComboboxSelected>>', lambda e: self.refresh_transports())
 
         body = ttk.Frame(tab, padding=(0, 4, 0, 0))
         body.pack(fill='both', expand=True)
@@ -1587,7 +2331,14 @@ class MainApp(tk.Tk):
         self.tr_canvas.yview_scroll(int(-event.delta / 120), 'units')
 
     def refresh_transports(self):
-        rows = query_transports()
+        date_from = self.tr_date_from_var.get().strip()
+        date_to = self.tr_date_to_var.get().strip()
+        for var in (self.tr_date_from_var, self.tr_date_to_var):
+            val = var.get().strip()
+            if val and parse_date(val) is None:
+                messagebox.showwarning('提示', '日期筛选格式应为 YYYY-MM-DD', parent=self)
+                return
+        rows = query_transports(date_from or '', date_to or '', self.tr_tag_var.get().strip())
         inner = self.tr_inner
         for child in inner.grid_slaves():
             try:
@@ -1613,7 +2364,8 @@ class MainApp(tk.Tk):
     def _insert_transport_row(self, parent, row, rec):
         values = (rec['t_date'], rec['depart'] or '—', rec['arrive'] or '—',
                   '¥%.2f' % rec['amount'],
-                  '有截图' if rec['screenshot'] else '—')
+                  '有截图' if rec['screenshot'] else '—',
+                  rec['trip_tag'] or '—')
         bg = self.SEL_BG if self.cur_tr_id == rec['id'] else '#FFFFFF'
         cells = []
         for i, v in enumerate(values):
@@ -1639,7 +2391,9 @@ class MainApp(tk.Tk):
             TransportDialog(self, dict(rec))
 
     def _export_transports(self):
-        rows = query_transports()
+        rows = query_transports(self.tr_date_from_var.get().strip() or '',
+                                self.tr_date_to_var.get().strip() or '',
+                                self.tr_tag_var.get().strip())
         path, n = export_transports_to_excel(rows)
         if path is None:
             messagebox.showinfo('导出', '当前没有交通记录可导出', parent=self); return
@@ -1666,18 +2420,57 @@ class MainApp(tk.Tk):
         menu.tk_popup(event.x_root, event.y_root)
 
     def _insert_lodging_row(self, parent, row, rec):
-        values = (rec['checkin_date'], rec['checkout_date'], rec['hotel'], '¥%.2f' % rec['amount'])
+        inv_cnt = rec.get('inv_cnt', 0)
+        rec_cnt = rec.get('rec_cnt', 0)
+        inv_text = '发票(%d)' % inv_cnt if inv_cnt else '—'
+        rec_text = '水单(%d)' % rec_cnt if rec_cnt else '—'
+        values = (rec['checkin_date'], rec['checkout_date'], rec['hotel'],
+                  '¥%.2f' % rec['amount'], inv_text, rec_text, rec['trip_tag'] or '—')
         bg = self.LOD_SEL_BG if self.cur_lod_id == rec['id'] else '#FFFFFF'
         cells = []
         for i, v in enumerate(values):
+            is_link = (i == 4 and inv_cnt) or (i == 5 and rec_cnt)
             lbl = tk.Label(parent, text=v, bg=bg, height=1, font=FONT, bd=0,
-                           anchor='w' if i == 2 else 'center')
+                           anchor='w' if i == 2 else 'center',
+                           foreground='#0563C1' if is_link else 'black',
+                           cursor='hand2' if is_link else 'arrow')
+            if is_link:
+                lbl.configure(font=(FONT[0], FONT[1], 'underline'))
             lbl.grid(row=row, column=i, sticky='nsew')
             cells.append(lbl)
-        for c in cells:
-            c.bind('<Button-1>', lambda e, lid=rec['id']: self._select_lodging(lid))
+        for i, c in enumerate(cells):
+            is_link = (i == 4 and inv_cnt) or (i == 5 and rec_cnt)
+            if is_link:
+                ft = 'invoice' if i == 4 else 'receipt'
+                c.bind('<Button-1>', lambda e, lid=rec['id'], ft=ft: self._show_lod_files_preview(lid, ft))
+            else:
+                c.bind('<Button-1>', lambda e, lid=rec['id']: self._select_lodging(lid))
             c.bind('<Double-1>', lambda e, lid=rec['id']: self._edit_lodging(lid))
             c.bind('<Button-3>', lambda e, lid=rec['id']: self._on_right_click_lodging(e, lid))
+
+    def _show_lod_files_preview(self, lodging_id, file_type):
+        tag = '发票' if file_type == 'invoice' else '水单'
+        files = [f for f in get_lodging_files(lodging_id) if f['file_type'] == file_type]
+        if not files:
+            messagebox.showinfo('提示', '暂无%s文件' % tag, parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title('%s列表' % tag)
+        win.transient(self)
+        ttk.Label(win, text='%s (%d 个文件):' % (tag, len(files)),
+                  font=FONT_BOLD, padding=10).pack(anchor='w')
+        for f in files:
+            abs_path = rel_to_abs(f['file_path'])
+            name = f['file_name'] or os.path.basename(f['file_path'])
+            if len(name) > 40:
+                name = name[:37] + '...'
+            btn = ttk.Button(win, text=name, width=45,
+                             command=lambda p=abs_path: self._open_file(p))
+            btn.pack(padx=10, pady=2, fill='x')
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
 
     def _select_lodging(self, lid):
         if self.cur_lod_id == lid:
@@ -1696,7 +2489,8 @@ class MainApp(tk.Tk):
     def _export_lodging(self):
         rows = query_lodging(self.lod_from_var.get().strip(),
                              self.lod_to_var.get().strip(),
-                             self.lod_kw_var.get().strip())
+                             self.lod_kw_var.get().strip(),
+                             self.lod_tag_var.get().strip())
         path, n = export_lodging_to_excel(rows)
         if path is None:
             messagebox.showinfo('导出', '当前筛选范围内没有住宿记录可导出', parent=self)
@@ -1717,6 +2511,7 @@ class MainApp(tk.Tk):
         self.lod_from_var.set('')
         self.lod_to_var.set('')
         self.lod_kw_var.set('')
+        self.lod_tag_var.set('')
         self.refresh_lodging()
 
     def _delete_lodging_selected(self):
@@ -1750,6 +2545,49 @@ class MainApp(tk.Tk):
     def _on_wheel(self, event):
         self.canvas.yview_scroll(int(-event.delta / 120), 'units')
 
+    def _build_calc_panel(self):
+        """计算出差费用总额面板, 位于 notebook 与状态栏之间"""
+        ttk.Separator(self).pack(fill='x')
+        frame = ttk.Frame(self, padding=(10, 6))
+        frame.pack(fill='x')
+
+        ttk.Label(frame, text='标签:').pack(side='left')
+        self.calc_tag_var = tk.StringVar()
+        self.calc_tag_combo = ttk.Combobox(frame, textvariable=self.calc_tag_var, width=30)
+        self.calc_tag_combo.pack(side='left', padx=(3, 0))
+        self.calc_tag_combo.bind('<FocusIn>', lambda e: self._refresh_calc_tags())
+
+        ttk.Button(frame, text='计算出差费用总额', command=self._do_calc).pack(side='left', padx=(8, 0))
+
+        self.calc_result_var = tk.StringVar()
+        self.calc_result_entry = ttk.Entry(frame, textvariable=self.calc_result_var, width=65, state='readonly')
+        self.calc_result_entry.pack(side='left', padx=(8, 0), fill='x', expand=True)
+
+    def _refresh_calc_tags(self):
+        tags = get_all_tags()
+        self.calc_tag_combo['values'] = tags
+
+    def _do_calc(self):
+        tag = self.calc_tag_var.get().strip()
+        if not tag:
+            messagebox.showwarning('提示', '请先选择出差标签')
+            return
+        try:
+            r = calc_trip_total(tag)
+        except Exception as e:
+            messagebox.showerror('计算错误', str(e))
+            return
+
+        lines = [
+            '%s (%s城市: %s)' % (tag, r['tier_name'], r['city'] or '未知'),
+            '行程: %d笔 ¥%.2f' % (r['trip_count'], r['trip_total']),
+            '住宿: %d笔 ¥%.2f' % (r['lod_count'], r['lod_total']),
+            '餐费: %d天×¥%d=¥%.2f' % (r['meal_days'], r['meal_rate'], r['meal_cost']),
+            '市内交通: %d天×¥%d=¥%.2f' % (r['transit_days'], r['transit_rate'], r['transit_cost']),
+            '合计: ¥%.2f' % r['total'],
+        ]
+        self.calc_result_var.set(' | '.join(lines))
+
     def _build_statusbar(self):
         self.status_var = tk.StringVar()
         ttk.Separator(self).pack(fill='x')
@@ -1764,7 +2602,18 @@ class MainApp(tk.Tk):
             if getattr(self, name).get().strip() and parse_date(getattr(self, name).get()) is None:
                 messagebox.showwarning('提示', '日期筛选格式应为 YYYY-MM-DD', parent=self)
                 return
-        rows = query_trips(date_from or '', date_to or '', self.keyword_var.get())
+        rows = query_trips(date_from or '', date_to or '', self.keyword_var.get(),
+                           self.trip_tag_var.get().strip())
+        # sqlite3.Row 只读,转为 dict 以便附加附件计数
+        rows = [dict(r) for r in rows]
+
+        # 批量获取附件计数
+        trip_ids = [r['id'] for r in rows]
+        file_counts = get_trip_file_counts(trip_ids)
+        for r in rows:
+            fc = file_counts.get(r['id'], {'invoice': 0, 'itinerary': 0})
+            r['inv_cnt'] = fc['invoice']
+            r['it_cnt'] = fc['itinerary']
 
         inner = self.inner
         # 清空列头以下的所有行(保留第 0 行列头)
@@ -1827,21 +2676,95 @@ class MainApp(tk.Tk):
 
     def _insert_trip_row(self, parent, row, rec):
         cost_val = rec['cost']
+        inv_cnt = rec.get('inv_cnt', 0)
+        it_cnt = rec.get('it_cnt', 0)
+        inv_text = '发票(%d)' % inv_cnt if inv_cnt else '—'
+        it_text = '行程单(%d)' % it_cnt if it_cnt else '—'
         values = (rec['trip_date'], rec['weekday'], rec['depart'], rec['arrive'],
                   rec['transport'],
                   '¥%.2f' % cost_val if cost_val else '—',
-                  '有' if rec['invoice'] else '—')
+                  inv_text, it_text, rec['trip_tag'] or '—')
         bg = self.SEL_BG if self.cur_trip_id == rec['id'] else '#FFFFFF'
         cells = []
         for i, v in enumerate(values):
+            is_link = (i == 6 and inv_cnt) or (i == 7 and it_cnt)
             lbl = tk.Label(parent, text=v, anchor='center', bg=bg, height=1,
-                           font=FONT, bd=0)
+                           font=FONT, bd=0,
+                           foreground='#0563C1' if is_link else 'black',
+                           cursor='hand2' if is_link else 'arrow')
+            if is_link:
+                lbl.configure(font=(FONT[0], FONT[1], 'underline'))
             lbl.grid(row=row, column=i, sticky='nsew')
             cells.append(lbl)
-        for c in cells:
-            c.bind('<Button-1>', lambda e, tid=rec['id']: self._select_trip(tid))
+        for i, c in enumerate(cells):
+            is_link = (i == 6 and inv_cnt) or (i == 7 and it_cnt)
+            if is_link:
+                ft = 'invoice' if i == 6 else 'itinerary'
+                c.bind('<Button-1>', lambda e, tid=rec['id'], ft=ft: self._show_files_preview(tid, ft))
+            else:
+                c.bind('<Button-1>', lambda e, tid=rec['id']: self._select_trip(tid))
             c.bind('<Double-1>', lambda e, tid=rec['id']: self._edit_by_id(tid))
             c.bind('<Button-3>', lambda e, tid=rec['id']: self._on_right_click_row(e, tid))
+
+    def _show_files_preview(self, trip_id, file_type):
+        """弹出附件列表窗口，每个文件可点击打开"""
+        tag = '发票' if file_type == 'invoice' else '电子行程单'
+        files = [f for f in get_trip_files(trip_id) if f['file_type'] == file_type]
+        if not files:
+            messagebox.showinfo('提示', '暂无%s文件' % tag, parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title('%s列表' % tag)
+        win.transient(self)
+        ttk.Label(win, text='%s (%d 个文件):' % (tag, len(files)),
+                  font=FONT_BOLD, padding=10).pack(anchor='w')
+        for f in files:
+            abs_path = rel_to_abs(f['file_path'])
+            name = f['file_name'] or os.path.basename(f['file_path'])
+            if len(name) > 40:
+                name = name[:37] + '...'
+            btn = ttk.Button(win, text=name, width=45,
+                             command=lambda p=abs_path: self._open_file(p))
+            btn.pack(padx=10, pady=2, fill='x')
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
+
+    def _open_file(self, abs_path):
+        """打开单个文件: PDF用系统默认程序，图片弹窗预览"""
+        if not abs_path or not os.path.isfile(abs_path):
+            messagebox.showinfo('提示', '文件不存在', parent=self)
+            return
+        ext = os.path.splitext(abs_path)[1].lower()
+        if ext == '.pdf':
+            try:
+                os.startfile(abs_path)
+            except OSError as e:
+                messagebox.showerror('提示', '无法打开 PDF: %s' % str(e), parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title('发票预览')
+        win.transient(self)
+        try:
+            img = Image.open(abs_path)
+            max_w, max_h = 800, 900
+            w, h = img.size
+            if w > max_w or h > max_h:
+                ratio = min(max_w / w, max_h / h)
+                img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(img)
+            canvas = tk.Canvas(win, width=photo.width(), height=photo.height(),
+                               highlightthickness=0)
+            canvas.pack(padx=10, pady=10)
+            canvas.create_image(0, 0, anchor='nw', image=photo)
+            canvas.image = photo
+        except Exception as e:
+            ttk.Label(win, text='无法加载图片: %s' % str(e), padding=20).pack()
+        win.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 2
+        win.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
 
     def _select_trip(self, trip_id):
         if self.cur_trip_id == trip_id:
@@ -1885,12 +2808,39 @@ class MainApp(tk.Tk):
         self.date_from_var.set('')
         self.date_to_var.set('')
         self.keyword_var.set('')
+        self.trip_tag_var.set('')
         self.refresh()
+
+    # ---- 餐饮/交通筛选辅助方法 ----
+    def _set_meal_month(self):
+        today = datetime.date.today()
+        self.meal_date_from_var.set(today.replace(day=1).isoformat())
+        self.meal_date_to_var.set(today.isoformat())
+        self.refresh_meals()
+
+    def _clear_meal_filter(self):
+        self.meal_date_from_var.set('')
+        self.meal_date_to_var.set('')
+        self.meal_tag_var.set('')
+        self.refresh_meals()
+
+    def _set_tr_month(self):
+        today = datetime.date.today()
+        self.tr_date_from_var.set(today.replace(day=1).isoformat())
+        self.tr_date_to_var.set(today.isoformat())
+        self.refresh_transports()
+
+    def _clear_tr_filter(self):
+        self.tr_date_from_var.set('')
+        self.tr_date_to_var.set('')
+        self.tr_tag_var.set('')
+        self.refresh_transports()
 
     def _export(self):
         rows = query_trips(self.date_from_var.get().strip() or '',
                            self.date_to_var.get().strip() or '',
-                           self.keyword_var.get())
+                           self.keyword_var.get(),
+                           self.trip_tag_var.get().strip())
         path, n = export_to_excel(rows)
         if path is None:
             messagebox.showinfo('导出', '当前筛选范围内没有可导出的记录', parent=self)

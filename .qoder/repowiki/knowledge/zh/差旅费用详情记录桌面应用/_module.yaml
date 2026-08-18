@@ -2,11 +2,10 @@ schema_version: 1
 module_path: ""
 title: 差旅费用详情记录桌面应用
 scope:
-    - .reasonix/
-    - reasonix.toml
-    - 启动差旅记录.bat
     - 差旅记录.pyw
-    - 差旅记录.exe
+    - 启动差旅记录.bat
+    - .gitignore
+    - 天津华瑞百川科技发展有限公司--《差旅管理制度》（内部资料拒绝转发）.pdf
     - 差旅费用详情记录表.xlsx
 source_files: []
 depends_on: []
